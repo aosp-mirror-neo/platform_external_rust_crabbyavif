@@ -1,0 +1,89 @@
+package {
+    default_applicable_licenses: ["external_rust_crabbyavif_license"],
+}
+
+license {
+    name: "external_rust_crabbyavif_license",
+    visibility: [":__subpackages__"],
+    license_kinds: [
+        "SPDX-license-identifier-Apache-2.0",
+    ],
+}
+
+rust_bindgen {
+    name: "libcrabbyavif_ndk_bindgen",
+    crate_name: "crabbyavif_ndk_bindgen",
+    wrapper_src: "sys/ndk-sys/wrapper.h",
+    source_stem: "ndk_media_bindgen",
+    shared_libs: [
+        "libmediandk",
+    ],
+    bindgen_flags: [
+        "--with-derive-default",
+    ],
+}
+
+rust_library_rlib {
+    name: "libndk_sys",
+    crate_name: "ndk_sys",
+    cargo_env_compat: true,
+    cargo_pkg_version: "0.1.0",
+    cfgs: ["android_soong"],
+    srcs: [
+        "sys/ndk-sys/src/lib.rs",
+        ":libcrabbyavif_ndk_bindgen",
+    ],
+    shared_libs: [
+        "libmediandk",
+    ],
+}
+
+rust_bindgen {
+    name: "libcrabbyavif_yuv_bindgen",
+    crate_name: "crabbyavif_yuv_bindgen",
+    wrapper_src: "sys/libyuv-sys/wrapper.h",
+    source_stem: "libyuv_bindgen",
+    product_available: true,
+    vendor_available: true,
+    whole_static_libs: [
+        "libyuv",
+    ],
+}
+
+rust_library_rlib {
+    name: "liblibyuv_sys",
+    crate_name: "libyuv_sys",
+    cargo_env_compat: true,
+    cargo_pkg_version: "0.1.0",
+    cfgs: ["android_soong"],
+    srcs: [
+        "sys/libyuv-sys/src/lib.rs",
+        ":libcrabbyavif_yuv_bindgen",
+    ],
+    whole_static_libs: [
+        "libyuv",
+    ],
+}
+
+rust_ffi {
+    name: "libcrabbyavif_ffi",
+    crate_name: "crabbyavif",
+    cargo_env_compat: true,
+    cargo_pkg_version: "0.1.0",
+    srcs: ["src/lib.rs"],
+    edition: "2021",
+    features: [
+        "android_mediacodec",
+        "libyuv",
+        "capi",
+    ],
+    rustlibs: [
+        "liblibyuv_sys",
+        "libndk_sys",
+    ],
+    include_dirs: ["include"],
+    apex_available: [
+        "//apex_available:platform",
+        "//apex_available:anyapex",
+    ],
+}
