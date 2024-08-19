@@ -25,8 +25,17 @@ use crate::decoder::Category;
 use crate::image::Image;
 use crate::AvifResult;
 
+#[derive(Default)]
+pub struct DecoderConfig {
+    pub operating_point: u8,
+    pub all_layers: bool,
+    pub width: u32,
+    pub height: u32,
+    pub max_threads: u32,
+}
+
 pub trait Decoder {
-    fn initialize(&mut self, operating_point: u8, all_layers: bool) -> AvifResult<()>;
+    fn initialize(&mut self, config: &DecoderConfig) -> AvifResult<()>;
     fn get_next_image(
         &mut self,
         av1_payload: &[u8],
