@@ -277,8 +277,8 @@ fn color_grid_gainmap_different_grid() {
     assert_eq!(decoder.gainmap().image.width, 64 * 2);
     assert_eq!(decoder.gainmap().image.height, 80 * 2);
     assert_eq!(decoder.gainmap().image.depth, 8);
-    assert_eq!(decoder.gainmap().metadata.alternate_hdr_headroom.0, 6);
-    assert_eq!(decoder.gainmap().metadata.alternate_hdr_headroom.1, 2);
+    assert_eq!(decoder.gainmap().metadata.base_hdr_headroom.0, 6);
+    assert_eq!(decoder.gainmap().metadata.base_hdr_headroom.1, 2);
     if !HAS_DECODER {
         return;
     }
@@ -304,8 +304,8 @@ fn color_grid_alpha_grid_gainmap_nogrid() {
     assert_eq!(decoder.gainmap().image.width, 64);
     assert_eq!(decoder.gainmap().image.height, 80);
     assert_eq!(decoder.gainmap().image.depth, 8);
-    assert_eq!(decoder.gainmap().metadata.alternate_hdr_headroom.0, 6);
-    assert_eq!(decoder.gainmap().metadata.alternate_hdr_headroom.1, 2);
+    assert_eq!(decoder.gainmap().metadata.base_hdr_headroom.0, 6);
+    assert_eq!(decoder.gainmap().metadata.base_hdr_headroom.1, 2);
     if !HAS_DECODER {
         return;
     }
@@ -331,13 +331,29 @@ fn color_nogrid_alpha_nogrid_gainmap_grid() {
     assert_eq!(decoder.gainmap().image.width, 64 * 2);
     assert_eq!(decoder.gainmap().image.height, 80 * 2);
     assert_eq!(decoder.gainmap().image.depth, 8);
-    assert_eq!(decoder.gainmap().metadata.alternate_hdr_headroom.0, 6);
-    assert_eq!(decoder.gainmap().metadata.alternate_hdr_headroom.1, 2);
+    assert_eq!(decoder.gainmap().metadata.base_hdr_headroom.0, 6);
+    assert_eq!(decoder.gainmap().metadata.base_hdr_headroom.1, 2);
     if !HAS_DECODER {
         return;
     }
     let res = decoder.next_image();
     assert!(res.is_ok());
+}
+
+// From avifgainmaptest.cc
+#[test]
+fn gainmap_oriented() {
+    let mut decoder = get_decoder("gainmap_oriented.avif");
+    decoder.settings.enable_decoding_gainmap = true;
+    decoder.settings.enable_parsing_gainmap_metadata = true;
+    let res = decoder.parse();
+    assert!(res.is_ok());
+    let image = decoder.image().expect("image was none");
+    assert_eq!(image.irot_angle, Some(1));
+    assert_eq!(image.imir_axis, Some(0));
+    assert!(decoder.gainmap_present());
+    assert_eq!(decoder.gainmap().image.irot_angle, None);
+    assert_eq!(decoder.gainmap().image.imir_axis, None);
 }
 
 // From avifcllitest.cc
@@ -712,4 +728,44 @@ fn white_1x1_ftyp_size0() -> AvifResult<()> {
         Err(AvifError::BmffParseFailed(_))
     ));
     Ok(())
+}
+
+#[test]
+fn dimg_repetition() {
+    let mut decoder = get_decoder("sofa_grid1x5_420_dimg_repeat.avif");
+    assert_eq!(
+        decoder.parse(),
+        Err(AvifError::BmffParseFailed(
+            "multiple dimg references for item ID 1".into()
+        ))
+    );
+}
+
+#[test]
+fn dimg_shared() {
+    let mut decoder = get_decoder("color_grid_alpha_grid_tile_shared_in_dimg.avif");
+    assert_eq!(decoder.parse(), Err(AvifError::NotImplemented));
+}
+
+#[test]
+fn dimg_ordering() {
+    if !HAS_DECODER {
+        return;
+    }
+    let mut decoder1 = get_decoder("sofa_grid1x5_420.avif");
+    let res = decoder1.parse();
+    assert!(res.is_ok());
+    let res = decoder1.next_image();
+    assert!(res.is_ok());
+    let mut decoder2 = get_decoder("sofa_grid1x5_420_random_dimg_order.avif");
+    let res = decoder2.parse();
+    assert!(res.is_ok());
+    let res = decoder2.next_image();
+    assert!(res.is_ok());
+    let image1 = decoder1.image().expect("image1 was none");
+    let image2 = decoder2.image().expect("image2 was none");
+    // Ensure that the pixels in image1 and image2 are not the same.
+    let row1 = image1.row(Plane::Y, 0).expect("row1 was none");
+    let row2 = image2.row(Plane::Y, 0).expect("row2 was none");
+    assert_ne!(row1, row2);
 }
