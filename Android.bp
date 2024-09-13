@@ -71,6 +71,7 @@ rust_ffi {
     cargo_env_compat: true,
     cargo_pkg_version: "0.1.0",
     srcs: ["src/lib.rs"],
+    cfgs: ["android_soong"],
     edition: "2021",
     features: [
         "android_mediacodec",
@@ -80,6 +81,7 @@ rust_ffi {
     rustlibs: [
         "liblibyuv_sys",
         "libndk_sys",
+        "librustutils",
     ],
     include_dirs: ["include"],
     apex_available: [
