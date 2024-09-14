@@ -364,9 +364,12 @@ impl Decoder {
         self.parse_state = ParseState::None;
     }
 
-    // This has an unsafe block and is intended for use only from the C API.
-    pub fn set_io_raw(&mut self, data: *const u8, size: usize) -> AvifResult<()> {
-        self.io = Some(Box::new(DecoderRawIO::create(data, size)));
+    /// # Safety
+    ///
+    /// This function is intended for use only from the C API. The assumption is that the caller
+    /// will always pass in a valid pointer and size.
+    pub unsafe fn set_io_raw(&mut self, data: *const u8, size: usize) -> AvifResult<()> {
+        self.io = Some(Box::new(unsafe { DecoderRawIO::create(data, size) }));
         self.parse_state = ParseState::None;
         Ok(())
     }
@@ -735,6 +738,10 @@ impl Decoder {
         if self.io.is_none() {
             return Err(AvifError::IoNotSet);
         }
+        if self.settings.enable_decoding_gainmap && !self.settings.enable_parsing_gainmap_metadata {
+            return Err(AvifError::InvalidArgument);
+        }
+
         if self.parse_state == ParseState::None {
             self.reset();
             let avif_boxes = mp4box::parse(self.io.unwrap_mut())?;
@@ -753,6 +760,11 @@ impl Decoder {
                 }
             }
             self.items = construct_items(&avif_boxes.meta)?;
+            if avif_boxes.ftyp.has_tmap() && !self.items.values().any(|x| x.item_type == "tmap") {
+                return Err(AvifError::BmffParseFailed(
+                    "tmap was required but not found".into(),
+                ));
+            }
             for item in self.items.values_mut() {
                 item.harvest_ispe(
                     self.settings.strictness.alpha_ispe_required(),
@@ -877,23 +889,25 @@ impl Decoder {
                 }
 
                 // Optional gainmap item
-                if let Some((tonemap_id, gainmap_id)) =
-                    self.find_gainmap_item(item_ids[Category::Color.usize()])?
-                {
-                    self.read_and_parse_item(gainmap_id, Category::Gainmap)?;
-                    self.populate_grid_item_ids(gainmap_id, Category::Gainmap)?;
-                    self.validate_gainmap_item(gainmap_id, tonemap_id)?;
-                    self.gainmap_present = true;
-                    if self.settings.enable_decoding_gainmap {
-                        item_ids[Category::Gainmap.usize()] = gainmap_id;
-                    }
-                    if self.settings.enable_parsing_gainmap_metadata {
+                if self.settings.enable_parsing_gainmap_metadata && avif_boxes.ftyp.has_tmap() {
+                    if let Some((tonemap_id, gainmap_id)) =
+                        self.find_gainmap_item(item_ids[Category::Color.usize()])?
+                    {
                         let tonemap_item = self
                             .items
                             .get_mut(&tonemap_id)
                             .ok_or(AvifError::InvalidToneMappedImage("".into()))?;
                         let mut stream = tonemap_item.stream(self.io.unwrap_mut())?;
-                        self.gainmap.metadata = mp4box::parse_tmap(&mut stream)?;
+                        if let Some(metadata) = mp4box::parse_tmap(&mut stream)? {
+                            self.gainmap.metadata = metadata;
+                            self.read_and_parse_item(gainmap_id, Category::Gainmap)?;
+                            self.populate_grid_item_ids(gainmap_id, Category::Gainmap)?;
+                            self.validate_gainmap_item(gainmap_id, tonemap_id)?;
+                            self.gainmap_present = true;
+                            if self.settings.enable_decoding_gainmap {
+                                item_ids[Category::Gainmap.usize()] = gainmap_id;
+                            }
+                        }
                     }
                 }
 
@@ -1130,6 +1144,7 @@ impl Decoder {
             all_layers: tile.input.all_layers,
             width: tile.width,
             height: tile.height,
+            depth: self.image.depth,
             max_threads: self.settings.max_threads,
         };
         codec.initialize(&config)?;
