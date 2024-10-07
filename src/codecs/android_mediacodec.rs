@@ -160,7 +160,8 @@ impl MediaFormat {
                 plane_info.offset[0] = 0;
                 plane_info.offset[1] = isize_from_i32(stride * slice_height)?;
                 let u_plane_size = isize_from_i32(((stride + 1) / 2) * ((height + 1) / 2))?;
-                plane_info.offset[2] = plane_info.offset[1] + u_plane_size;
+                // When color format is YUV_420_FLEXIBLE, the V plane comes before the U plane.
+                plane_info.offset[2] = plane_info.offset[1] - u_plane_size;
             }
         }
         Ok(plane_info)
@@ -214,38 +215,66 @@ enum CodecInitializer {
     ByMimeType(String),
 }
 
-fn get_codec_initializers(mime_type: &str) -> Vec<CodecInitializer> {
-    let dav1d = String::from("c2.android.av1-dav1d.decoder");
-    let gav1 = String::from("c2.android.av1.decoder");
+#[cfg(android_soong)]
+fn prefer_hardware_decoder(config: &DecoderConfig) -> bool {
+    let prefer_hw = rustutils::system_properties::read_bool(
+        "media.stagefright.thumbnail.prefer_hw_codecs",
+        false,
+    )
+    .unwrap_or(false);
+    // We will return true when all of the below conditions are true:
+    // 1) prefer_hw is true.
+    // 2) category is not Alpha. We do not prefer hardware for decoding the alpha plane since
+    //    they generally tend to be monochrome images and using hardware for that is
+    //    unreliable.
+    // 3) profile is 0. As of Sep 2024, there are no AV1 hardware decoders that support
+    //    anything other than profile 0.
+    prefer_hw && config.category != Category::Alpha && config.codec_config.profile() == 0
+}
+
+fn get_codec_initializers(config: &DecoderConfig) -> Vec<CodecInitializer> {
     #[cfg(android_soong)]
     {
         // Use a specific decoder if it is requested.
         if let Ok(Some(decoder)) =
             rustutils::system_properties::read("media.crabbyavif.debug.decoder")
         {
-            return vec![CodecInitializer::ByName(decoder)];
-        }
-        // If hardware decoders are allowed, then search by mime type first and then try the
-        // software decoders.
-        let prefer_hw = rustutils::system_properties::read_bool(
-            "media.stagefright.thumbnail.prefer_hw_codecs",
-            false,
-        )
-        .unwrap_or(false);
-        if prefer_hw {
-            return vec![
-                CodecInitializer::ByMimeType(mime_type.to_string()),
-                CodecInitializer::ByName(dav1d),
-                CodecInitializer::ByName(gav1),
-            ];
+            if !decoder.is_empty() {
+                return vec![CodecInitializer::ByName(decoder)];
+            }
         }
     }
-    // Default list of initializers.
-    vec![
-        CodecInitializer::ByName(dav1d),
-        CodecInitializer::ByName(gav1),
-        CodecInitializer::ByMimeType(mime_type.to_string()),
-    ]
+    let dav1d = String::from("c2.android.av1-dav1d.decoder");
+    let gav1 = String::from("c2.android.av1.decoder");
+    // As of Sep 2024, c2.android.av1.decoder is the only known decoder to support 12-bit AV1. So
+    // prefer that for 12 bit images.
+    let prefer_gav1 = config.depth == 12;
+    let mime_type = MediaCodec::AV1_MIME;
+    let prefer_hw = false;
+    #[cfg(android_soong)]
+    let prefer_hw = prefer_hardware_decoder(config);
+    match (prefer_hw, prefer_gav1) {
+        (true, true) => vec![
+            CodecInitializer::ByName(gav1),
+            CodecInitializer::ByMimeType(mime_type.to_string()),
+            CodecInitializer::ByName(dav1d),
+        ],
+        (true, false) => vec![
+            CodecInitializer::ByMimeType(mime_type.to_string()),
+            CodecInitializer::ByName(dav1d),
+            CodecInitializer::ByName(gav1),
+        ],
+        (false, true) => vec![
+            CodecInitializer::ByName(gav1),
+            CodecInitializer::ByName(dav1d),
+            CodecInitializer::ByMimeType(mime_type.to_string()),
+        ],
+        (false, false) => vec![
+            CodecInitializer::ByName(dav1d),
+            CodecInitializer::ByName(gav1),
+            CodecInitializer::ByMimeType(mime_type.to_string()),
+        ],
+    }
 }
 
 #[derive(Debug, Default)]
@@ -262,6 +291,7 @@ impl MediaCodec {
     // YUV P010 format used for 10-bit images:
     // https://developer.android.com/reference/android/media/MediaCodecInfo.CodecCapabilities#COLOR_FormatYUVP010
     const YUV_P010: i32 = 54;
+    const AV1_MIME: &str = "video/av01";
 }
 
 impl Decoder for MediaCodec {
@@ -273,7 +303,7 @@ impl Decoder for MediaCodec {
         if format.is_null() {
             return Err(AvifError::UnknownError("".into()));
         }
-        c_str!(mime_type, mime_type_tmp, "video/av01");
+        c_str!(mime_type, mime_type_tmp, Self::AV1_MIME);
         unsafe {
             AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, mime_type);
             AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, i32_from_u32(config.width)?);
@@ -291,10 +321,24 @@ impl Decoder for MediaCodec {
             // https://developer.android.com/reference/android/media/MediaFormat#KEY_LOW_LATENCY
             c_str!(low_latency, low_latency_tmp, "low-latency");
             AMediaFormat_setInt32(format, low_latency, 1);
+            AMediaFormat_setInt32(
+                format,
+                AMEDIAFORMAT_KEY_MAX_INPUT_SIZE,
+                i32_from_usize(config.max_input_size)?,
+            );
+            let codec_specific_data = config.codec_config.raw_data();
+            if !codec_specific_data.is_empty() {
+                AMediaFormat_setBuffer(
+                    format,
+                    AMEDIAFORMAT_KEY_CSD_0,
+                    codec_specific_data.as_ptr() as *const _,
+                    codec_specific_data.len(),
+                );
+            }
         }
 
         let mut codec = ptr::null_mut();
-        for codec_initializer in get_codec_initializers("video/av01") {
+        for codec_initializer in get_codec_initializers(config) {
             codec = match codec_initializer {
                 CodecInitializer::ByName(name) => {
                     c_str!(codec_name, codec_name_tmp, name.as_str());
@@ -365,6 +409,12 @@ impl Decoder for MediaCodec {
                 if input_buffer.is_null() {
                     return Err(AvifError::UnknownError(format!(
                         "input buffer at index {input_index} was null"
+                    )));
+                }
+                if input_buffer_size < av1_payload.len() {
+                    return Err(AvifError::UnknownError(format!(
+                        "input buffer (size {input_buffer_size}) was not big enough. required size: {}",
+                        av1_payload.len()
                     )));
                 }
                 ptr::copy_nonoverlapping(av1_payload.as_ptr(), input_buffer, av1_payload.len());
