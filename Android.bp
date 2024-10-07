@@ -11,6 +11,22 @@ license {
 }
 
 rust_bindgen {
+    name: "libcrabbyavif_mediaimage2_bindgen",
+    crate_name: "crabbyavif_mediaimage2_bindgen",
+    wrapper_src: "sys/ndk-sys/mediaimage2_wrapper.hpp",
+    source_stem: "mediaimage2_bindgen",
+    header_libs: [
+        "media_plugin_headers",
+    ],
+    bindgen_flags: [
+        "--allowlist-item=android::MediaImage2?",
+        "--no-recursive-allowlist",
+        "--no-layout-tests",
+        "--no-doc-comments",
+    ],
+}
+
+rust_bindgen {
     name: "libcrabbyavif_ndk_bindgen",
     crate_name: "crabbyavif_ndk_bindgen",
     wrapper_src: "sys/ndk-sys/wrapper.h",
@@ -70,7 +86,11 @@ rust_ffi {
     crate_name: "crabbyavif",
     cargo_env_compat: true,
     cargo_pkg_version: "0.1.0",
-    srcs: ["src/lib.rs"],
+    srcs: [
+        "src/lib.rs",
+        ":libcrabbyavif_mediaimage2_bindgen",
+    ],
+    cfgs: ["android_soong"],
     edition: "2021",
     features: [
         "android_mediacodec",
@@ -80,6 +100,7 @@ rust_ffi {
     rustlibs: [
         "liblibyuv_sys",
         "libndk_sys",
+        "librustutils",
     ],
     include_dirs: ["include"],
     apex_available: [

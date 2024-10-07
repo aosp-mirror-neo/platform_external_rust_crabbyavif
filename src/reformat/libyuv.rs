@@ -117,6 +117,17 @@ type YUVToRGBMatrixHighBitDepth = unsafe extern "C" fn(
 type YUVAToRGBMatrixHighBitDepth = unsafe extern "C" fn(
     *const u16, c_int, *const u16, c_int, *const u16, c_int, *const u16, c_int, *mut u8, c_int,
     *const YuvConstants, c_int, c_int, c_int) -> c_int;
+#[rustfmt::skip]
+type P010ToAR30Matrix = unsafe extern "C" fn(
+    *const u16, c_int, *const u16, c_int, *mut u8, c_int, *const YuvConstants, c_int,
+    c_int) -> c_int;
+#[rustfmt::skip]
+type AR30ToAB30 = unsafe extern "C" fn(
+    *const u8, c_int, *mut u8, c_int, c_int, c_int) -> c_int;
+#[rustfmt::skip]
+type NVToARGBMatrix = unsafe extern "C" fn(
+    *const u8, c_int, *const u8, c_int, *mut u8, c_int, *const YuvConstants, c_int,
+    c_int) -> c_int;
 
 #[derive(Debug)]
 enum ConversionFunction {
@@ -129,6 +140,8 @@ enum ConversionFunction {
     YUVAToRGBMatrixFilterHighBitDepth(YUVAToRGBMatrixFilterHighBitDepth),
     YUVToRGBMatrixHighBitDepth(YUVToRGBMatrixHighBitDepth),
     YUVAToRGBMatrixHighBitDepth(YUVAToRGBMatrixHighBitDepth),
+    P010ToRGBA1010102Matrix(P010ToAR30Matrix, AR30ToAB30),
+    NVToARGBMatrix(NVToARGBMatrix),
 }
 
 impl ConversionFunction {
@@ -150,6 +163,17 @@ fn find_conversion_function(
     alpha_preferred: bool,
 ) -> Option<ConversionFunction> {
     match (alpha_preferred, yuv_depth, rgb.format, yuv_format) {
+        (_, 8, Format::Rgba, PixelFormat::AndroidNv12) => {
+            // What Android considers to be NV12 is actually NV21 in libyuv.
+            Some(ConversionFunction::NVToARGBMatrix(NV21ToARGBMatrix))
+        }
+        (_, 8, Format::Rgba, PixelFormat::AndroidNv21) => {
+            // What Android considers to be NV21 is actually NV12 in libyuv.
+            Some(ConversionFunction::NVToARGBMatrix(NV12ToARGBMatrix))
+        }
+        (_, 10, Format::Rgba1010102, PixelFormat::AndroidP010) => Some(
+            ConversionFunction::P010ToRGBA1010102Matrix(P010ToAR30Matrix, AR30ToAB30),
+        ),
         (true, 10, Format::Rgba | Format::Bgra, PixelFormat::Yuv422)
             if rgb.chroma_upsampling.bilinear_or_better_filter_allowed() =>
         {
@@ -336,9 +360,17 @@ fn find_conversion_function(
 }
 
 pub fn yuv_to_rgb(image: &image::Image, rgb: &mut rgb::Image) -> AvifResult<bool> {
-    if rgb.depth != 8 || (image.depth != 8 && image.depth != 10 && image.depth != 12) {
+    if (rgb.depth != 8 && rgb.depth != 10)
+        || (image.depth != 8 && image.depth != 10 && image.depth != 12)
+    {
         return Err(AvifError::NotImplemented);
     }
+    if rgb.depth == 10
+        && (image.yuv_format != PixelFormat::AndroidP010 || rgb.format != Format::Rgba1010102)
+    {
+        return Err(AvifError::NotImplemented);
+    }
+
     let (matrix_yuv, matrix_yvu) = find_constants(image).ok_or(AvifError::NotImplemented)?;
     let alpha_preferred = rgb.has_alpha() && image.has_alpha();
     let conversion_function =
@@ -397,6 +429,33 @@ pub fn yuv_to_rgb(image: &image::Image, rgb: &mut rgb::Image) -> AvifResult<bool
         let mut high_bd_matched = true;
         // Apply one of the high bitdepth functions if possible.
         result = match conversion_function {
+            ConversionFunction::P010ToRGBA1010102Matrix(func1, func2) => {
+                let result = func1(
+                    plane_u16[0],
+                    plane_row_bytes[0] / 2,
+                    plane_u16[1],
+                    plane_row_bytes[1] / 2,
+                    rgb.pixels(),
+                    rgb_row_bytes,
+                    matrix,
+                    width,
+                    height,
+                );
+                if result == 0 {
+                    // It is okay to use the same pointer as source and destintaion for AR30 to
+                    // AB30 conversion.
+                    func2(
+                        rgb.pixels(),
+                        rgb_row_bytes,
+                        rgb.pixels(),
+                        rgb_row_bytes,
+                        width,
+                        height,
+                    )
+                } else {
+                    result
+                }
+            }
             ConversionFunction::YUVToRGBMatrixFilterHighBitDepth(func) => func(
                 plane_u16[0],
                 plane_row_bytes[0] / 2,
@@ -498,6 +557,17 @@ pub fn yuv_to_rgb(image: &image::Image, rgb: &mut rgb::Image) -> AvifResult<bool
                 .unwrap();
         }
         result = match conversion_function {
+            ConversionFunction::NVToARGBMatrix(func) => func(
+                plane_u8[0],
+                plane_row_bytes[0],
+                plane_u8[1],
+                plane_row_bytes[1],
+                rgb.pixels(),
+                rgb_row_bytes,
+                matrix,
+                width,
+                height,
+            ),
             ConversionFunction::YUV400ToRGBMatrix(func) => func(
                 plane_u8[0],
                 plane_row_bytes[0],
