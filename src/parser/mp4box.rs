@@ -111,8 +111,8 @@ pub struct PixelInformation {
     pub plane_depths: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct CodecConfiguration {
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Av1CodecConfiguration {
     pub seq_profile: u8,
     pub seq_level_idx0: u8,
     pub seq_tier0: u8,
@@ -122,28 +122,53 @@ pub struct CodecConfiguration {
     pub chroma_subsampling_x: u8,
     pub chroma_subsampling_y: u8,
     pub chroma_sample_position: ChromaSamplePosition,
+    pub raw_data: Vec<u8>,
 }
 
 impl CodecConfiguration {
     pub fn depth(&self) -> u8 {
-        match self.twelve_bit {
-            true => 12,
-            false => match self.high_bitdepth {
-                true => 10,
-                false => 8,
+        match self {
+            Self::Av1(config) => match config.twelve_bit {
+                true => 12,
+                false => match config.high_bitdepth {
+                    true => 10,
+                    false => 8,
+                },
             },
         }
     }
 
     pub fn pixel_format(&self) -> PixelFormat {
-        if self.monochrome {
-            PixelFormat::Yuv400
-        } else if self.chroma_subsampling_x == 1 && self.chroma_subsampling_y == 1 {
-            PixelFormat::Yuv420
-        } else if self.chroma_subsampling_x == 1 {
-            PixelFormat::Yuv422
-        } else {
-            PixelFormat::Yuv444
+        match self {
+            Self::Av1(config) => {
+                if config.monochrome {
+                    PixelFormat::Yuv400
+                } else if config.chroma_subsampling_x == 1 && config.chroma_subsampling_y == 1 {
+                    PixelFormat::Yuv420
+                } else if config.chroma_subsampling_x == 1 {
+                    PixelFormat::Yuv422
+                } else {
+                    PixelFormat::Yuv444
+                }
+            }
+        }
+    }
+
+    pub fn chroma_sample_position(&self) -> ChromaSamplePosition {
+        match self {
+            Self::Av1(config) => config.chroma_sample_position,
+        }
+    }
+
+    pub fn raw_data(&self) -> &Vec<u8> {
+        match self {
+            Self::Av1(config) => &config.raw_data,
+        }
+    }
+
+    pub fn profile(&self) -> u8 {
+        match self {
+            Self::Av1(config) => config.seq_profile,
         }
     }
 }
@@ -177,6 +202,17 @@ pub struct PixelAspectRatio {
 pub struct ContentLightLevelInformation {
     pub max_cll: u16,
     pub max_pall: u16,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CodecConfiguration {
+    Av1(Av1CodecConfiguration),
+}
+
+impl Default for CodecConfiguration {
+    fn default() -> Self {
+        Self::Av1(Av1CodecConfiguration::default())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -501,6 +537,7 @@ fn parse_pixi(stream: &mut IStream) -> AvifResult<ItemProperty> {
 
 #[allow(non_snake_case)]
 fn parse_av1C(stream: &mut IStream) -> AvifResult<ItemProperty> {
+    let raw_data = stream.get_immutable_vec(stream.bytes_left()?)?;
     // See https://aomediacodec.github.io/av1-isobmff/v1.2.0.html#av1codecconfigurationbox-syntax.
     let mut bits = stream.sub_bit_stream(4)?;
     // unsigned int (1) marker = 1;
@@ -517,7 +554,7 @@ fn parse_av1C(stream: &mut IStream) -> AvifResult<ItemProperty> {
             "Invalid version ({version}) in av1C"
         )));
     }
-    let av1C = CodecConfiguration {
+    let av1C = Av1CodecConfiguration {
         // unsigned int(3) seq_profile;
         // unsigned int(5) seq_level_idx_0;
         seq_profile: bits.read(3)? as u8,
@@ -536,6 +573,7 @@ fn parse_av1C(stream: &mut IStream) -> AvifResult<ItemProperty> {
         chroma_subsampling_x: bits.read(1)? as u8,
         chroma_subsampling_y: bits.read(1)? as u8,
         chroma_sample_position: bits.read(2)?.into(),
+        raw_data,
     };
 
     // unsigned int(3) reserved = 0;
@@ -573,7 +611,9 @@ fn parse_av1C(stream: &mut IStream) -> AvifResult<ItemProperty> {
 
     // unsigned int(8) configOBUs[];
 
-    Ok(ItemProperty::CodecConfiguration(av1C))
+    Ok(ItemProperty::CodecConfiguration(CodecConfiguration::Av1(
+        av1C,
+    )))
 }
 
 fn parse_colr(stream: &mut IStream) -> AvifResult<ItemProperty> {
