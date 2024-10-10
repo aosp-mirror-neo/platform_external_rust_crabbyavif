@@ -31,7 +31,7 @@ rust_bindgen {
     crate_name: "crabbyavif_ndk_bindgen",
     wrapper_src: "sys/ndk-sys/wrapper.h",
     source_stem: "ndk_media_bindgen",
-    shared_libs: [
+    header_libs: [
         "libmediandk",
     ],
     bindgen_flags: [
@@ -39,7 +39,7 @@ rust_bindgen {
     ],
 }
 
-rust_library_rlib {
+rust_library {
     name: "libndk_sys",
     crate_name: "ndk_sys",
     cargo_env_compat: true,
@@ -61,12 +61,12 @@ rust_bindgen {
     source_stem: "libyuv_bindgen",
     product_available: true,
     vendor_available: true,
-    whole_static_libs: [
+    header_libs: [
         "libyuv",
     ],
 }
 
-rust_library_rlib {
+rust_library {
     name: "liblibyuv_sys",
     crate_name: "libyuv_sys",
     cargo_env_compat: true,
@@ -81,7 +81,7 @@ rust_library_rlib {
     ],
 }
 
-rust_ffi {
+rust_ffi_static {
     name: "libcrabbyavif_ffi",
     crate_name: "crabbyavif",
     cargo_env_compat: true,
@@ -101,6 +101,9 @@ rust_ffi {
         "liblibyuv_sys",
         "libndk_sys",
         "librustutils",
+    ],
+    shared_libs: [
+        "libmediandk",
     ],
     include_dirs: ["include"],
     apex_available: [
