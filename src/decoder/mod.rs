@@ -75,22 +75,28 @@ pub enum CodecChoice {
 }
 
 impl CodecChoice {
-    fn get_codec(&self) -> AvifResult<Codec> {
+    fn get_codec(&self, is_avif: bool) -> AvifResult<Codec> {
         match self {
             CodecChoice::Auto => {
                 // Preferred order of codecs in Auto mode: Android MediaCodec, Dav1d, Libgav1.
                 CodecChoice::MediaCodec
-                    .get_codec()
-                    .or_else(|_| CodecChoice::Dav1d.get_codec())
-                    .or_else(|_| CodecChoice::Libgav1.get_codec())
+                    .get_codec(is_avif)
+                    .or_else(|_| CodecChoice::Dav1d.get_codec(is_avif))
+                    .or_else(|_| CodecChoice::Libgav1.get_codec(is_avif))
             }
             CodecChoice::Dav1d => {
+                if !is_avif {
+                    return Err(AvifError::NoCodecAvailable);
+                }
                 #[cfg(feature = "dav1d")]
                 return Ok(Box::<Dav1d>::default());
                 #[cfg(not(feature = "dav1d"))]
                 return Err(AvifError::NoCodecAvailable);
             }
             CodecChoice::Libgav1 => {
+                if !is_avif {
+                    return Err(AvifError::NoCodecAvailable);
+                }
                 #[cfg(feature = "libgav1")]
                 return Ok(Box::<Libgav1>::default());
                 #[cfg(not(feature = "libgav1"))]
@@ -130,6 +136,7 @@ pub struct Settings {
     pub allow_incremental: bool,
     pub enable_decoding_gainmap: bool,
     pub enable_parsing_gainmap_metadata: bool,
+    pub ignore_color_and_alpha: bool,
     pub codec_choice: CodecChoice,
     pub image_size_limit: u32,
     pub image_dimension_limit: u32,
@@ -148,6 +155,7 @@ impl Default for Settings {
             allow_incremental: false,
             enable_decoding_gainmap: false,
             enable_parsing_gainmap_metadata: false,
+            ignore_color_and_alpha: false,
             codec_choice: Default::default(),
             image_size_limit: DEFAULT_IMAGE_SIZE_LIMIT,
             image_dimension_limit: DEFAULT_IMAGE_DIMENSION_LIMIT,
@@ -421,13 +429,7 @@ impl Decoder {
             .ok_or(AvifError::NotImplemented)?;
         let first_item = self.items.get(&alpha_item_indices[0]).unwrap();
         let properties = match first_item.codec_config() {
-            Some(CodecConfiguration::Av1(config)) => {
-                let mut vector: Vec<ItemProperty> = create_vec_exact(1)?;
-                vector.push(ItemProperty::CodecConfiguration(CodecConfiguration::Av1(
-                    config.clone(),
-                )));
-                vector
-            }
+            Some(config) => vec![ItemProperty::CodecConfiguration(config.clone())],
             None => return Ok(None),
         };
         let alpha_item = Item {
@@ -1131,7 +1133,10 @@ impl Decoder {
 
     fn create_codec(&mut self, category: Category, tile_index: usize) -> AvifResult<()> {
         let tile = &self.tiles[category.usize()][tile_index];
-        let mut codec: Codec = self.settings.codec_choice.get_codec()?;
+        let mut codec: Codec = self
+            .settings
+            .codec_choice
+            .get_codec(tile.codec_config.is_avif())?;
         let config = DecoderConfig {
             operating_point: tile.operating_point,
             all_layers: tile.input.all_layers,
@@ -1431,15 +1436,27 @@ impl Decoder {
     }
 
     fn decode_tiles(&mut self, image_index: usize) -> AvifResult<()> {
+        let mut decoded_something = false;
         for category in Category::ALL {
+            if self.settings.ignore_color_and_alpha
+                && (category == Category::Color || category == Category::Alpha)
+            {
+                continue;
+            }
+
             let previous_decoded_tile_count =
                 self.tile_info[category.usize()].decoded_tile_count as usize;
             let tile_count = self.tiles[category.usize()].len();
             for tile_index in previous_decoded_tile_count..tile_count {
                 self.decode_tile(image_index, category, tile_index)?;
+                decoded_something = true;
             }
         }
-        Ok(())
+        if decoded_something {
+            Ok(())
+        } else {
+            Err(AvifError::NoContent)
+        }
     }
 
     pub fn next_image(&mut self) -> AvifResult<()> {
