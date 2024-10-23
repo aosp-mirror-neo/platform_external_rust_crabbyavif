@@ -415,6 +415,7 @@ struct avifDecoder {
     avifBool gainMapPresent;
     avifBool enableDecodingGainMap;
     avifBool enableParsingGainMapMetadata;
+    avifBool ignoreColorAndAlpha;
     avifBool imageSequenceTrackPresent;
     Box<Decoder> rust_decoder;
     avifImage image_object;
@@ -606,7 +607,7 @@ avifResult crabby_avifImageScale(avifImage *image,
                                  uint32_t dstHeight,
                                  avifDiagnostics *_diag);
 
-const char *crabby_avifResultToString(avifResult _res);
+const char *crabby_avifResultToString(avifResult res);
 
 avifBool crabby_avifCropRectConvertCleanApertureBox(avifCropRect *cropRect,
                                                     const avifCleanApertureBox *clap,
