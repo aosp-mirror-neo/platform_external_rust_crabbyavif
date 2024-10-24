@@ -75,35 +75,40 @@ pub enum CodecChoice {
 }
 
 impl CodecChoice {
-    fn get_codec(&self) -> AvifResult<Codec> {
+    fn get_codec(&self, is_avif: bool) -> AvifResult<Codec> {
         match self {
             CodecChoice::Auto => {
                 // Preferred order of codecs in Auto mode: Android MediaCodec, Dav1d, Libgav1.
-                return CodecChoice::MediaCodec
-                    .get_codec()
-                    .or_else(|_| CodecChoice::Dav1d.get_codec())
-                    .or_else(|_| CodecChoice::Libgav1.get_codec());
+                CodecChoice::MediaCodec
+                    .get_codec(is_avif)
+                    .or_else(|_| CodecChoice::Dav1d.get_codec(is_avif))
+                    .or_else(|_| CodecChoice::Libgav1.get_codec(is_avif))
             }
             CodecChoice::Dav1d => {
-                #[cfg(feature = "dav1d")]
-                {
-                    return Ok(Box::<Dav1d>::default());
+                if !is_avif {
+                    return Err(AvifError::NoCodecAvailable);
                 }
+                #[cfg(feature = "dav1d")]
+                return Ok(Box::<Dav1d>::default());
+                #[cfg(not(feature = "dav1d"))]
+                return Err(AvifError::NoCodecAvailable);
             }
             CodecChoice::Libgav1 => {
-                #[cfg(feature = "libgav1")]
-                {
-                    return Ok(Box::<Libgav1>::default());
+                if !is_avif {
+                    return Err(AvifError::NoCodecAvailable);
                 }
+                #[cfg(feature = "libgav1")]
+                return Ok(Box::<Libgav1>::default());
+                #[cfg(not(feature = "libgav1"))]
+                return Err(AvifError::NoCodecAvailable);
             }
             CodecChoice::MediaCodec => {
                 #[cfg(feature = "android_mediacodec")]
-                {
-                    return Ok(Box::<MediaCodec>::default());
-                }
+                return Ok(Box::<MediaCodec>::default());
+                #[cfg(not(feature = "android_mediacodec"))]
+                return Err(AvifError::NoCodecAvailable);
             }
         }
-        Err(AvifError::NoCodecAvailable)
     }
 }
 
@@ -131,6 +136,7 @@ pub struct Settings {
     pub allow_incremental: bool,
     pub enable_decoding_gainmap: bool,
     pub enable_parsing_gainmap_metadata: bool,
+    pub ignore_color_and_alpha: bool,
     pub codec_choice: CodecChoice,
     pub image_size_limit: u32,
     pub image_dimension_limit: u32,
@@ -149,6 +155,7 @@ impl Default for Settings {
             allow_incremental: false,
             enable_decoding_gainmap: false,
             enable_parsing_gainmap_metadata: false,
+            ignore_color_and_alpha: false,
             codec_choice: Default::default(),
             image_size_limit: DEFAULT_IMAGE_SIZE_LIMIT,
             image_dimension_limit: DEFAULT_IMAGE_DIMENSION_LIMIT,
@@ -311,7 +318,7 @@ impl Category {
 macro_rules! find_property {
     ($properties:expr, $property_name:ident) => {
         $properties.iter().find_map(|p| match p {
-            ItemProperty::$property_name(value) => Some(*value),
+            ItemProperty::$property_name(value) => Some(value.clone()),
             _ => None,
         })
     };
@@ -364,9 +371,12 @@ impl Decoder {
         self.parse_state = ParseState::None;
     }
 
-    // This has an unsafe block and is intended for use only from the C API.
-    pub fn set_io_raw(&mut self, data: *const u8, size: usize) -> AvifResult<()> {
-        self.io = Some(Box::new(DecoderRawIO::create(data, size)));
+    /// # Safety
+    ///
+    /// This function is intended for use only from the C API. The assumption is that the caller
+    /// will always pass in a valid pointer and size.
+    pub unsafe fn set_io_raw(&mut self, data: *const u8, size: usize) -> AvifResult<()> {
+        self.io = Some(Box::new(unsafe { DecoderRawIO::create(data, size) }));
         self.parse_state = ParseState::None;
         Ok(())
     }
@@ -418,13 +428,8 @@ impl Decoder {
             .checked_add(1)
             .ok_or(AvifError::NotImplemented)?;
         let first_item = self.items.get(&alpha_item_indices[0]).unwrap();
-        let properties = match first_item.av1C() {
-            #[allow(non_snake_case)]
-            Some(av1C) => {
-                let mut vector: Vec<ItemProperty> = create_vec_exact(1)?;
-                vector.push(ItemProperty::CodecConfiguration(*av1C));
-                vector
-            }
+        let properties = match first_item.codec_config() {
+            Some(config) => vec![ItemProperty::CodecConfiguration(config.clone())],
             None => return Ok(None),
         };
         let alpha_item = Item {
@@ -652,8 +657,7 @@ impl Decoder {
         }
         let tile_count = self.tile_info[category.usize()].grid_tile_count()? as usize;
         let mut grid_item_ids: Vec<u32> = create_vec_exact(tile_count)?;
-        #[allow(non_snake_case)]
-        let mut first_av1C: Option<CodecConfiguration> = None;
+        let mut first_codec_config: Option<CodecConfiguration> = None;
         // Collect all the dimg items.
         for dimg_item_id in self.items.keys() {
             if *dimg_item_id == item_id {
@@ -671,13 +675,16 @@ impl Decoder {
                     "invalid input item in dimg grid".into(),
                 ));
             }
-            if first_av1C.is_none() {
+            if first_codec_config.is_none() {
                 // Adopt the configuration property of the first tile.
                 // validate_properties() makes sure they are all equal.
-                first_av1C = Some(
-                    *dimg_item
-                        .av1C()
-                        .ok_or(AvifError::BmffParseFailed("missing av1C property".into()))?,
+                first_codec_config = Some(
+                    dimg_item
+                        .codec_config()
+                        .ok_or(AvifError::BmffParseFailed(
+                            "missing codec config property".into(),
+                        ))?
+                        .clone(),
                 );
             }
             if grid_item_ids.len() >= tile_count {
@@ -699,8 +706,9 @@ impl Decoder {
         // the 'iref' box.
         grid_item_ids.sort_by_key(|k| self.items.get(k).unwrap().dimg_index);
         let item = self.items.get_mut(&item_id).unwrap();
-        item.properties
-            .push(ItemProperty::CodecConfiguration(first_av1C.unwrap()));
+        item.properties.push(ItemProperty::CodecConfiguration(
+            first_codec_config.unwrap(),
+        ));
         item.grid_item_ids = grid_item_ids;
         Ok(())
     }
@@ -735,6 +743,10 @@ impl Decoder {
         if self.io.is_none() {
             return Err(AvifError::IoNotSet);
         }
+        if self.settings.enable_decoding_gainmap && !self.settings.enable_parsing_gainmap_metadata {
+            return Err(AvifError::InvalidArgument);
+        }
+
         if self.parse_state == ParseState::None {
             self.reset();
             let avif_boxes = mp4box::parse(self.io.unwrap_mut())?;
@@ -753,6 +765,11 @@ impl Decoder {
                 }
             }
             self.items = construct_items(&avif_boxes.meta)?;
+            if avif_boxes.ftyp.has_tmap() && !self.items.values().any(|x| x.item_type == "tmap") {
+                return Err(AvifError::BmffParseFailed(
+                    "tmap was required but not found".into(),
+                ));
+            }
             for item in self.items.values_mut() {
                 item.harvest_ispe(
                     self.settings.strictness.alpha_ispe_required(),
@@ -877,23 +894,25 @@ impl Decoder {
                 }
 
                 // Optional gainmap item
-                if let Some((tonemap_id, gainmap_id)) =
-                    self.find_gainmap_item(item_ids[Category::Color.usize()])?
-                {
-                    self.read_and_parse_item(gainmap_id, Category::Gainmap)?;
-                    self.populate_grid_item_ids(gainmap_id, Category::Gainmap)?;
-                    self.validate_gainmap_item(gainmap_id, tonemap_id)?;
-                    self.gainmap_present = true;
-                    if self.settings.enable_decoding_gainmap {
-                        item_ids[Category::Gainmap.usize()] = gainmap_id;
-                    }
-                    if self.settings.enable_parsing_gainmap_metadata {
+                if self.settings.enable_parsing_gainmap_metadata && avif_boxes.ftyp.has_tmap() {
+                    if let Some((tonemap_id, gainmap_id)) =
+                        self.find_gainmap_item(item_ids[Category::Color.usize()])?
+                    {
                         let tonemap_item = self
                             .items
                             .get_mut(&tonemap_id)
                             .ok_or(AvifError::InvalidToneMappedImage("".into()))?;
                         let mut stream = tonemap_item.stream(self.io.unwrap_mut())?;
-                        self.gainmap.metadata = mp4box::parse_tmap(&mut stream)?;
+                        if let Some(metadata) = mp4box::parse_tmap(&mut stream)? {
+                            self.gainmap.metadata = metadata;
+                            self.read_and_parse_item(gainmap_id, Category::Gainmap)?;
+                            self.populate_grid_item_ids(gainmap_id, Category::Gainmap)?;
+                            self.validate_gainmap_item(gainmap_id, tonemap_id)?;
+                            self.gainmap_present = true;
+                            if self.settings.enable_decoding_gainmap {
+                                item_ids[Category::Gainmap.usize()] = gainmap_id;
+                            }
+                        }
                     }
                 }
 
@@ -959,13 +978,13 @@ impl Decoder {
                         .unwrap();
                     self.gainmap.image.width = gainmap_item.width;
                     self.gainmap.image.height = gainmap_item.height;
-                    #[allow(non_snake_case)]
-                    let av1C = gainmap_item
-                        .av1C()
+                    let codec_config = gainmap_item
+                        .codec_config()
                         .ok_or(AvifError::BmffParseFailed("".into()))?;
-                    self.gainmap.image.depth = av1C.depth();
-                    self.gainmap.image.yuv_format = av1C.pixel_format();
-                    self.gainmap.image.chroma_sample_position = av1C.chroma_sample_position;
+                    self.gainmap.image.depth = codec_config.depth();
+                    self.gainmap.image.yuv_format = codec_config.pixel_format();
+                    self.gainmap.image.chroma_sample_position =
+                        codec_config.chroma_sample_position();
                 }
 
                 // This borrow has to be in the end of this branch.
@@ -1043,12 +1062,11 @@ impl Decoder {
                 }
             }
 
-            #[allow(non_snake_case)]
-            let av1C = find_property!(color_properties, CodecConfiguration)
+            let codec_config = find_property!(color_properties, CodecConfiguration)
                 .ok_or(AvifError::BmffParseFailed("".into()))?;
-            self.image.depth = av1C.depth();
-            self.image.yuv_format = av1C.pixel_format();
-            self.image.chroma_sample_position = av1C.chroma_sample_position;
+            self.image.depth = codec_config.depth();
+            self.image.yuv_format = codec_config.pixel_format();
+            self.image.chroma_sample_position = codec_config.chroma_sample_position();
 
             if cicp_set {
                 self.parse_state = ParseState::Complete;
@@ -1076,16 +1094,7 @@ impl Decoder {
         )
     }
 
-    #[allow(unreachable_code)]
     fn can_use_single_codec(&self) -> AvifResult<bool> {
-        #[cfg(feature = "android_mediacodec")]
-        {
-            // Android MediaCodec does not support using a single codec instance for images of
-            // varying formats (which could happen when image contains alpha).
-            // TODO: return false for now. But investigate cases where it is possible to use a
-            // single codec instance (it may work for grids).
-            return Ok(false);
-        }
         let total_tile_count = checked_add!(
             checked_add!(self.tiles[0].len(), self.tiles[1].len())?,
             self.tiles[2].len()
@@ -1124,13 +1133,20 @@ impl Decoder {
 
     fn create_codec(&mut self, category: Category, tile_index: usize) -> AvifResult<()> {
         let tile = &self.tiles[category.usize()][tile_index];
-        let mut codec: Codec = self.settings.codec_choice.get_codec()?;
+        let mut codec: Codec = self
+            .settings
+            .codec_choice
+            .get_codec(tile.codec_config.is_avif())?;
         let config = DecoderConfig {
             operating_point: tile.operating_point,
             all_layers: tile.input.all_layers,
             width: tile.width,
             height: tile.height,
+            depth: self.image.depth,
             max_threads: self.settings.max_threads,
+            max_input_size: tile.max_sample_size(),
+            codec_config: tile.codec_config.clone(),
+            category,
         };
         codec.initialize(&config)?;
         self.codecs.push(codec);
@@ -1141,15 +1157,21 @@ impl Decoder {
         if !self.codecs.is_empty() {
             return Ok(());
         }
-        if matches!(self.source, Source::Tracks) {
-            // In this case, we will use at most two codec instances (one for the color planes and
-            // one for the alpha plane). Gain maps are not supported.
-            self.codecs = create_vec_exact(2)?;
-            self.create_codec(Category::Color, 0)?;
-            self.tiles[Category::Color.usize()][0].codec_index = 0;
-            if !self.tiles[Category::Alpha.usize()].is_empty() {
-                self.create_codec(Category::Alpha, 0)?;
-                self.tiles[Category::Alpha.usize()][0].codec_index = 1;
+        if matches!(self.source, Source::Tracks) || cfg!(feature = "android_mediacodec") {
+            // In this case, there are two possibilities in the following order:
+            //  1) If source is Tracks, then we will use at most two codec instances (one each for
+            //     Color and Alpha). Gainmap will always be empty.
+            //  2) If android_mediacodec is true, then we will use at most three codec instances
+            //     (one for each category).
+            self.codecs = create_vec_exact(3)?;
+            for category in Category::ALL {
+                if self.tiles[category.usize()].is_empty() {
+                    continue;
+                }
+                self.create_codec(category, 0)?;
+                for tile in &mut self.tiles[category.usize()] {
+                    tile.codec_index = self.codecs.len() - 1;
+                }
             }
         } else if self.can_use_single_codec()? {
             self.codecs = create_vec_exact(1)?;
@@ -1414,15 +1436,27 @@ impl Decoder {
     }
 
     fn decode_tiles(&mut self, image_index: usize) -> AvifResult<()> {
+        let mut decoded_something = false;
         for category in Category::ALL {
+            if self.settings.ignore_color_and_alpha
+                && (category == Category::Color || category == Category::Alpha)
+            {
+                continue;
+            }
+
             let previous_decoded_tile_count =
                 self.tile_info[category.usize()].decoded_tile_count as usize;
             let tile_count = self.tiles[category.usize()].len();
             for tile_index in previous_decoded_tile_count..tile_count {
                 self.decode_tile(image_index, category, tile_index)?;
+                decoded_something = true;
             }
         }
-        Ok(())
+        if decoded_something {
+            Ok(())
+        } else {
+            Err(AvifError::NoContent)
+        }
     }
 
     pub fn next_image(&mut self) -> AvifResult<()> {
