@@ -32,7 +32,7 @@ impl DecodeSample {
         io: &'a mut Box<impl decoder::IO + ?Sized>,
         buffer: &'a Option<Vec<u8>>,
         size: usize,
-    ) -> AvifResult<&[u8]> {
+    ) -> AvifResult<&'a [u8]> {
         match buffer {
             Some(x) => {
                 let start_offset = usize_from_u64(self.offset)?;
@@ -56,7 +56,7 @@ impl DecodeSample {
         &'a self,
         io: &'a mut Box<impl decoder::IO + ?Sized>,
         buffer: &'a Option<Vec<u8>>,
-    ) -> AvifResult<&[u8]> {
+    ) -> AvifResult<&'a [u8]> {
         self.partial_data(io, buffer, self.size)
     }
 }
@@ -122,6 +122,7 @@ pub struct Tile {
     pub image: Image,
     pub input: DecodeInput,
     pub codec_index: usize,
+    pub codec_config: CodecConfiguration,
 }
 
 impl Tile {
@@ -139,6 +140,10 @@ impl Tile {
             height: item.height,
             operating_point: item.operating_point(),
             image: Image::default(),
+            codec_config: item
+                .codec_config()
+                .ok_or(AvifError::BmffParseFailed("missing av1C property".into()))?
+                .clone(),
             ..Tile::default()
         };
         let mut layer_sizes: [usize; MAX_AV1_LAYER_COUNT] = [0; MAX_AV1_LAYER_COUNT];
@@ -334,5 +339,12 @@ impl Tile {
             tile.input.samples[index - 1].sync = true;
         }
         Ok(tile)
+    }
+
+    pub fn max_sample_size(&self) -> usize {
+        match self.input.samples.iter().max_by_key(|sample| sample.size) {
+            Some(sample) => sample.size,
+            None => 0,
+        }
     }
 }
