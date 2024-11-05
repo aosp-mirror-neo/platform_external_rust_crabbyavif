@@ -18,6 +18,7 @@ use crate::decoder::Category;
 use crate::image::Image;
 use crate::image::YuvRange;
 use crate::internal_utils::pixels::*;
+use crate::internal_utils::stream::IStream;
 use crate::internal_utils::*;
 use crate::*;
 
@@ -160,7 +161,8 @@ impl MediaFormat {
                 plane_info.offset[0] = 0;
                 plane_info.offset[1] = isize_from_i32(stride * slice_height)?;
                 let u_plane_size = isize_from_i32(((stride + 1) / 2) * ((height + 1) / 2))?;
-                plane_info.offset[2] = plane_info.offset[1] + u_plane_size;
+                // When color format is YUV_420_FLEXIBLE, the V plane comes before the U plane.
+                plane_info.offset[2] = plane_info.offset[1] - u_plane_size;
             }
         }
         Ok(plane_info)
@@ -214,45 +216,84 @@ enum CodecInitializer {
     ByMimeType(String),
 }
 
-fn get_codec_initializers(mime_type: &str) -> Vec<CodecInitializer> {
-    let dav1d = String::from("c2.android.av1-dav1d.decoder");
-    let gav1 = String::from("c2.android.av1.decoder");
+#[cfg(android_soong)]
+fn prefer_hardware_decoder(config: &DecoderConfig) -> bool {
+    let prefer_hw = rustutils::system_properties::read_bool(
+        "media.stagefright.thumbnail.prefer_hw_codecs",
+        false,
+    )
+    .unwrap_or(false);
+    // We will return true when all of the below conditions are true:
+    // 1) prefer_hw is true.
+    // 2) category is not Alpha. We do not prefer hardware for decoding the alpha plane since
+    //    they generally tend to be monochrome images and using hardware for that is
+    //    unreliable.
+    // 3) profile is 0. As of Sep 2024, there are no AV1 hardware decoders that support
+    //    anything other than profile 0.
+    prefer_hw && config.category != Category::Alpha && config.codec_config.profile() == 0
+}
+
+fn get_codec_initializers(config: &DecoderConfig) -> Vec<CodecInitializer> {
     #[cfg(android_soong)]
     {
         // Use a specific decoder if it is requested.
         if let Ok(Some(decoder)) =
             rustutils::system_properties::read("media.crabbyavif.debug.decoder")
         {
-            return vec![CodecInitializer::ByName(decoder)];
-        }
-        // If hardware decoders are allowed, then search by mime type first and then try the
-        // software decoders.
-        let prefer_hw = rustutils::system_properties::read_bool(
-            "media.stagefright.thumbnail.prefer_hw_codecs",
-            false,
-        )
-        .unwrap_or(false);
-        if prefer_hw {
-            return vec![
-                CodecInitializer::ByMimeType(mime_type.to_string()),
-                CodecInitializer::ByName(dav1d),
-                CodecInitializer::ByName(gav1),
-            ];
+            if !decoder.is_empty() {
+                return vec![CodecInitializer::ByName(decoder)];
+            }
         }
     }
-    // Default list of initializers.
-    vec![
-        CodecInitializer::ByName(dav1d),
-        CodecInitializer::ByName(gav1),
-        CodecInitializer::ByMimeType(mime_type.to_string()),
-    ]
+    let dav1d = String::from("c2.android.av1-dav1d.decoder");
+    let gav1 = String::from("c2.android.av1.decoder");
+    let hevc = String::from("c2.android.hevc.decoder");
+    // As of Sep 2024, c2.android.av1.decoder is the only known decoder to support 12-bit AV1. So
+    // prefer that for 12 bit images.
+    let prefer_gav1 = config.depth == 12;
+    let is_avif = config.codec_config.is_avif();
+    let mime_type = if is_avif { MediaCodec::AV1_MIME } else { MediaCodec::HEVC_MIME };
+    let prefer_hw = false;
+    #[cfg(android_soong)]
+    let prefer_hw = prefer_hardware_decoder(config);
+    match (prefer_hw, is_avif, prefer_gav1) {
+        (true, false, _) => vec![
+            CodecInitializer::ByMimeType(mime_type.to_string()),
+            CodecInitializer::ByName(hevc),
+        ],
+        (false, false, _) => vec![
+            CodecInitializer::ByName(hevc),
+            CodecInitializer::ByMimeType(mime_type.to_string()),
+        ],
+        (true, true, true) => vec![
+            CodecInitializer::ByName(gav1),
+            CodecInitializer::ByMimeType(mime_type.to_string()),
+            CodecInitializer::ByName(dav1d),
+        ],
+        (true, true, false) => vec![
+            CodecInitializer::ByMimeType(mime_type.to_string()),
+            CodecInitializer::ByName(dav1d),
+            CodecInitializer::ByName(gav1),
+        ],
+        (false, true, true) => vec![
+            CodecInitializer::ByName(gav1),
+            CodecInitializer::ByName(dav1d),
+            CodecInitializer::ByMimeType(mime_type.to_string()),
+        ],
+        (false, true, false) => vec![
+            CodecInitializer::ByName(dav1d),
+            CodecInitializer::ByName(gav1),
+            CodecInitializer::ByMimeType(mime_type.to_string()),
+        ],
+    }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MediaCodec {
     codec: Option<*mut AMediaCodec>,
     format: Option<MediaFormat>,
     output_buffer_index: Option<usize>,
+    config: Option<DecoderConfig>,
 }
 
 impl MediaCodec {
@@ -262,6 +303,8 @@ impl MediaCodec {
     // YUV P010 format used for 10-bit images:
     // https://developer.android.com/reference/android/media/MediaCodecInfo.CodecCapabilities#COLOR_FormatYUVP010
     const YUV_P010: i32 = 54;
+    const AV1_MIME: &str = "video/av01";
+    const HEVC_MIME: &str = "video/hevc";
 }
 
 impl Decoder for MediaCodec {
@@ -273,7 +316,11 @@ impl Decoder for MediaCodec {
         if format.is_null() {
             return Err(AvifError::UnknownError("".into()));
         }
-        c_str!(mime_type, mime_type_tmp, "video/av01");
+        c_str!(
+            mime_type,
+            mime_type_tmp,
+            if config.codec_config.is_avif() { Self::AV1_MIME } else { Self::HEVC_MIME }
+        );
         unsafe {
             AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, mime_type);
             AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, i32_from_u32(config.width)?);
@@ -291,10 +338,24 @@ impl Decoder for MediaCodec {
             // https://developer.android.com/reference/android/media/MediaFormat#KEY_LOW_LATENCY
             c_str!(low_latency, low_latency_tmp, "low-latency");
             AMediaFormat_setInt32(format, low_latency, 1);
+            AMediaFormat_setInt32(
+                format,
+                AMEDIAFORMAT_KEY_MAX_INPUT_SIZE,
+                i32_from_usize(config.max_input_size)?,
+            );
+            let codec_specific_data = config.codec_config.raw_data();
+            if !codec_specific_data.is_empty() {
+                AMediaFormat_setBuffer(
+                    format,
+                    AMEDIAFORMAT_KEY_CSD_0,
+                    codec_specific_data.as_ptr() as *const _,
+                    codec_specific_data.len(),
+                );
+            }
         }
 
         let mut codec = ptr::null_mut();
-        for codec_initializer in get_codec_initializers("video/av01") {
+        for codec_initializer in get_codec_initializers(config) {
             codec = match codec_initializer {
                 CodecInitializer::ByName(name) => {
                     c_str!(codec_name, codec_name_tmp, name.as_str());
@@ -333,12 +394,13 @@ impl Decoder for MediaCodec {
             return Err(AvifError::NoCodecAvailable);
         }
         self.codec = Some(codec);
+        self.config = Some(config.clone());
         Ok(())
     }
 
     fn get_next_image(
         &mut self,
-        av1_payload: &[u8],
+        payload: &[u8],
         _spatial_id: u8,
         image: &mut Image,
         category: Category,
@@ -367,12 +429,24 @@ impl Decoder for MediaCodec {
                         "input buffer at index {input_index} was null"
                     )));
                 }
-                ptr::copy_nonoverlapping(av1_payload.as_ptr(), input_buffer, av1_payload.len());
+                let hevc_whole_nal_units = self.hevc_whole_nal_units(payload)?;
+                let codec_payload = match &hevc_whole_nal_units {
+                    Some(hevc_payload) => hevc_payload,
+                    None => payload,
+                };
+                if input_buffer_size < codec_payload.len() {
+                    return Err(AvifError::UnknownError(format!(
+                        "input buffer (size {input_buffer_size}) was not big enough. required size: {}",
+                        codec_payload.len()
+                    )));
+                }
+                ptr::copy_nonoverlapping(codec_payload.as_ptr(), input_buffer, codec_payload.len());
+
                 if AMediaCodec_queueInputBuffer(
                     codec,
                     usize_from_isize(input_index)?,
                     /*offset=*/ 0,
-                    av1_payload.len(),
+                    codec_payload.len(),
                     /*pts=*/ 0,
                     /*flags=*/ 0,
                 ) != media_status_t_AMEDIA_OK
@@ -481,6 +555,33 @@ impl Decoder for MediaCodec {
             }
         }
         Ok(())
+    }
+}
+
+impl MediaCodec {
+    fn hevc_whole_nal_units(&self, payload: &[u8]) -> AvifResult<Option<Vec<u8>>> {
+        if !self.config.unwrap_ref().codec_config.is_heic() {
+            return Ok(None);
+        }
+        // For HEVC, MediaCodec expects whole NAL units with each unit prefixed with a start code
+        // of "\x00\x00\x00\x01".
+        let nal_length_size = self.config.unwrap_ref().codec_config.nal_length_size() as usize;
+        let mut offset = 0;
+        let mut hevc_payload = Vec::new();
+        while offset < payload.len() {
+            let payload_slice = &payload[offset..];
+            let mut stream = IStream::create(payload_slice);
+            let nal_length = usize_from_u64(stream.read_uxx(nal_length_size as u8)?)?;
+            let nal_unit_end = checked_add!(nal_length, nal_length_size)?;
+            let nal_unit_range = nal_length_size..nal_unit_end;
+            check_slice_range(payload_slice.len(), &nal_unit_range)?;
+            // Start code.
+            hevc_payload.extend_from_slice(&[0, 0, 0, 1]);
+            // NAL Unit.
+            hevc_payload.extend_from_slice(&payload_slice[nal_unit_range]);
+            offset = checked_add!(offset, nal_unit_end)?;
+        }
+        Ok(Some(hevc_payload))
     }
 }
 
