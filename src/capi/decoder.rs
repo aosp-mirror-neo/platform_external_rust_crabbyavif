@@ -48,17 +48,18 @@ pub struct avifDecoder {
     pub duration: f64,
     pub durationInTimescales: u64,
     pub repetitionCount: i32,
-
     pub alphaPresent: avifBool,
-
     pub ioStats: IOStats,
     pub diag: avifDiagnostics,
-    //avifIO * io;
     pub data: *mut avifDecoderData,
     pub imageContentToDecode: avifImageContentTypeFlags,
     pub imageSequenceTrackPresent: avifBool,
 
-    // TODO: maybe wrap these fields in a private data kind of field?
+    // These fields are not part of libavif. Any new fields that are to be header file compatible
+    // with libavif must be added before this line.
+    pub androidMediaCodecOutputColorFormat: AndroidMediaCodecOutputColorFormat,
+
+    // Rust specific fields that are not accessed from the C/C++ layer.
     rust_decoder: Box<Decoder>,
     image_object: avifImage,
     gainmap_object: avifGainMap,
@@ -94,6 +95,7 @@ impl Default for avifDecoder {
             data: std::ptr::null_mut(),
             imageContentToDecode: AVIF_IMAGE_CONTENT_COLOR_AND_ALPHA,
             imageSequenceTrackPresent: AVIF_FALSE,
+            androidMediaCodecOutputColorFormat: AndroidMediaCodecOutputColorFormat::default(),
             rust_decoder: Box::<Decoder>::default(),
             image_object: avifImage::default(),
             gainmap_image_object: avifImage::default(),
@@ -145,7 +147,6 @@ pub unsafe extern "C" fn crabby_avifDecoderSetSource(
     unsafe {
         (*decoder).requestedSource = source;
     }
-    // TODO: should decoder be reset here in case this is called after parse?
     avifResult::Ok
 }
 
@@ -193,6 +194,7 @@ impl From<&avifDecoder> for Settings {
             image_dimension_limit: decoder.imageDimensionLimit,
             image_count_limit: decoder.imageCountLimit,
             max_threads: u32::try_from(decoder.maxThreads).unwrap_or(0),
+            android_mediacodec_output_color_format: decoder.androidMediaCodecOutputColorFormat,
         }
     }
 }
