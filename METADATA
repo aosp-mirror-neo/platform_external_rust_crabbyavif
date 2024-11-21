@@ -15,7 +15,7 @@ third_party {
   identifier {
     type: "Git"
     value: "https://github.com/webmproject/CrabbyAvif.git"
-    version: "d474f1ec7d34e97fe928b860cfb2aa9e7b6beea1"
+    version: "d04ffe94eb03562a58083e9af687ec0cdf9b6ab7"
     primary_source: true
   }
 }
