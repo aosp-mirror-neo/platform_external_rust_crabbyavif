@@ -70,7 +70,7 @@ impl PlaneInfo {
 
     fn depth(&self) -> u8 {
         match self.color_format {
-            AndroidMediaCodecOutputColorFormat::P010 => 10,
+            AndroidMediaCodecOutputColorFormat::P010 => 16,
             AndroidMediaCodecOutputColorFormat::Yuv420Flexible => 8,
         }
     }
@@ -223,14 +223,25 @@ fn prefer_hardware_decoder(config: &DecoderConfig) -> bool {
         false,
     )
     .unwrap_or(false);
-    // We will return true when all of the below conditions are true:
-    // 1) prefer_hw is true.
-    // 2) category is not Alpha. We do not prefer hardware for decoding the alpha plane since
-    //    they generally tend to be monochrome images and using hardware for that is
-    //    unreliable.
-    // 3) profile is 0. As of Sep 2024, there are no AV1 hardware decoders that support
-    //    anything other than profile 0.
-    prefer_hw && config.category != Category::Alpha && config.codec_config.profile() == 0
+    if config.codec_config.is_avif() {
+        // We will return true when all of the below conditions are true:
+        // 1) prefer_hw is true.
+        // 2) category is not Alpha and category is not Gainmap. We do not prefer hardware for
+        //    decoding these categories since they generally tend to be monochrome images and using
+        //    hardware for that is unreliable.
+        // 3) profile is 0. As of Sep 2024, there are no AV1 hardware decoders that support
+        //    anything other than profile 0.
+        prefer_hw
+            && config.category != Category::Alpha
+            && config.category != Category::Gainmap
+            && config.codec_config.profile() == 0
+    } else {
+        // We will return true when one of the following conditions are true:
+        // 1) prefer_hw is true.
+        // 2) depth is greater than 8. As of Nov 2024, the default HEVC software decoder on Android
+        //    only supports 8-bit images.
+        prefer_hw || config.depth > 8
+    }
 }
 
 fn get_codec_initializers(config: &DecoderConfig) -> Vec<CodecInitializer> {
@@ -326,7 +337,11 @@ impl Decoder for MediaCodec {
             AMediaFormat_setInt32(
                 format,
                 AMEDIAFORMAT_KEY_COLOR_FORMAT,
-                config.android_mediacodec_output_color_format as i32,
+                if config.depth == 8 {
+                    AndroidMediaCodecOutputColorFormat::Yuv420Flexible
+                } else {
+                    AndroidMediaCodecOutputColorFormat::P010
+                } as i32,
             );
             // low-latency is documented but isn't exposed as a constant in the NDK:
             // https://developer.android.com/reference/android/media/MediaFormat#KEY_LOW_LATENCY
