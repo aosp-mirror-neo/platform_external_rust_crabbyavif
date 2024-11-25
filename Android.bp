@@ -96,6 +96,7 @@ rust_ffi_static {
         "android_mediacodec",
         "libyuv",
         "capi",
+        "heic",
     ],
     rustlibs: [
         "liblibyuv_sys",
