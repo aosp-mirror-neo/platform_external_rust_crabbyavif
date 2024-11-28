@@ -44,7 +44,7 @@ impl BoxHeader {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct FileTypeBox {
     pub major_brand: String,
     // minor_version "is informative only" (section 4.3.1 of ISO/IEC 14496-12)
@@ -70,12 +70,18 @@ impl FileTypeBox {
     pub fn is_avif(&self) -> bool {
         // "avio" also exists but does not identify the file as AVIF on its own. See
         // https://aomediacodec.github.io/av1-avif/v1.1.0.html#image-and-image-collection-brand
-        self.has_brand_any(&[
-            "avif",
-            "avis",
-            #[cfg(feature = "heic")]
-            "heic",
-        ])
+        if self.has_brand_any(&["avif", "avis"]) {
+            return true;
+        }
+        match (cfg!(feature = "heic"), cfg!(android_soong)) {
+            (false, _) => false,
+            (true, false) => self.has_brand("heic"),
+            (true, true) => {
+                // This is temporary. For the Android Framework, recognize HEIC files only if they
+                // also contain a gainmap.
+                self.has_brand("heic") && self.has_tmap()
+            }
+        }
     }
 
     pub fn needs_meta(&self) -> bool {
@@ -404,8 +410,31 @@ fn parse_header(stream: &mut IStream, top_level: bool) -> AvifResult<BoxHeader> 
     })
 }
 
+// Reads a truncated ftyp box. Populates as many brands as it can read.
+fn parse_truncated_ftyp(stream: &mut IStream) -> FileTypeBox {
+    // Section 4.3.2 of ISO/IEC 14496-12.
+    // unsigned int(32) major_brand;
+    let major_brand = match stream.read_string(4) {
+        Ok(major_brand) => major_brand,
+        Err(_) => return FileTypeBox::default(),
+    };
+    let mut compatible_brands: Vec<String> = Vec::new();
+    // unsigned int(32) compatible_brands[];  // to end of the box
+    while stream.has_bytes_left().unwrap_or_default() {
+        match stream.read_string(4) {
+            Ok(brand) => compatible_brands.push(brand),
+            Err(_) => break,
+        }
+    }
+    FileTypeBox {
+        major_brand,
+        compatible_brands,
+    }
+}
+
 fn parse_ftyp(stream: &mut IStream) -> AvifResult<FileTypeBox> {
     // Section 4.3.2 of ISO/IEC 14496-12.
+    // unsigned int(32) major_brand;
     let major_brand = stream.read_string(4)?;
     // unsigned int(4) minor_version;
     stream.skip_u32()?;
@@ -416,6 +445,7 @@ fn parse_ftyp(stream: &mut IStream) -> AvifResult<FileTypeBox> {
         )));
     }
     let mut compatible_brands: Vec<String> = create_vec_exact(stream.bytes_left()? / 4)?;
+    // unsigned int(32) compatible_brands[];  // to end of the box
     while stream.has_bytes_left()? {
         compatible_brands.push(stream.read_string(4)?);
     }
@@ -1699,8 +1729,10 @@ fn parse_elst(stream: &mut IStream, track: &mut Track) -> AvifResult<()> {
     //   flags - the following values are defined. The values of flags greater than 1 are reserved
     //     RepeatEdits 1
     if (flags & 1) == 0 {
+        // The only EditList feature that we support is repetition count for animated images. So in
+        // this case, we know that the repetition count is zero and we do not care about the rest
+        // of this box.
         track.is_repeating = false;
-        // TODO: This early return is not part of the spec, investigate
         return Ok(());
     }
     track.is_repeating = true;
@@ -1838,6 +1870,15 @@ pub fn parse(io: &mut GenericIO) -> AvifResult<AvifBoxes> {
         // Read the rest of the box if necessary.
         match header.box_type.as_str() {
             "ftyp" | "meta" | "moov" => {
+                if ftyp.is_none() && header.box_type != "ftyp" {
+                    // Section 6.3.4 of ISO/IEC 14496-12:
+                    //   The FileTypeBox shall occur before any variable-length box. Only a
+                    //   fixed-size box such as a file signature, if required, may precede it.
+                    return Err(AvifError::BmffParseFailed(format!(
+                        "expected ftyp box. found {}.",
+                        header.box_type,
+                    )));
+                }
                 let box_data = match header.size {
                     BoxSize::UntilEndOfStream => io.read(parse_offset, usize::MAX)?,
                     BoxSize::FixedSize(size) => io.read_exact(parse_offset, size)?,
@@ -1851,10 +1892,7 @@ pub fn parse(io: &mut GenericIO) -> AvifResult<AvifBoxes> {
                         }
                     }
                     "meta" => meta = Some(parse_meta(&mut box_stream)?),
-                    "moov" => {
-                        tracks = Some(parse_moov(&mut box_stream)?);
-                        // decoder.image_sequence_track_present = true;
-                    }
+                    "moov" => tracks = Some(parse_moov(&mut box_stream)?),
                     _ => {} // Not reached.
                 }
                 if ftyp.is_some() {
@@ -1884,7 +1922,6 @@ pub fn parse(io: &mut GenericIO) -> AvifResult<AvifBoxes> {
     if (ftyp.needs_meta() && meta.is_none()) || (ftyp.needs_moov() && tracks.is_none()) {
         return Err(AvifError::TruncatedData);
     }
-    // TODO: Enforce 'ftyp' as first box seen, for consistency with peek_compatible_file_type()?
     Ok(AvifBoxes {
         ftyp,
         meta: meta.unwrap_or_default(),
@@ -1901,13 +1938,19 @@ pub fn peek_compatible_file_type(data: &[u8]) -> AvifResult<bool> {
         //   Only a fixed-size box such as a file signature, if required, may precede it.
         return Ok(false);
     }
-    if header.size == BoxSize::UntilEndOfStream {
+    let header_size = match header.size {
+        BoxSize::FixedSize(size) => size,
         // The 'ftyp' box goes on till the end of the file. Either there is no brand requiring
         // anything in the file but a FileTypebox (so not AVIF), or it is invalid.
-        return Ok(false);
-    }
-    let mut header_stream = stream.sub_stream(&header.size)?;
-    let ftyp = parse_ftyp(&mut header_stream)?;
+        BoxSize::UntilEndOfStream => return Ok(false),
+    };
+    let ftyp = if header_size > stream.bytes_left()? {
+        let mut header_stream = stream.sub_stream(&BoxSize::FixedSize(stream.bytes_left()?))?;
+        parse_truncated_ftyp(&mut header_stream)
+    } else {
+        let mut header_stream = stream.sub_stream(&header.size)?;
+        parse_ftyp(&mut header_stream)?
+    };
     Ok(ftyp.is_avif())
 }
 
@@ -1993,12 +2036,14 @@ mod tests {
             0x00, 0x00, 0x00, 0xf2, 0x6d, 0x65, 0x74, 0x61, //
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28, //
         ];
-        let min_required_bytes = 32;
+        // Peeking should succeed starting from byte length 12. Since that is the end offset of the
+        // first valid AVIF brand.
+        let min_required_bytes = 12;
         for i in 0..buf.len() {
             let res = mp4box::peek_compatible_file_type(&buf[..i]);
             if i < min_required_bytes {
-                // Not enough bytes.
-                assert!(res.is_err());
+                // Not enough bytes. The return should either be an error or false.
+                assert!(res.is_err() || !res.unwrap());
             } else {
                 assert!(res?);
             }
