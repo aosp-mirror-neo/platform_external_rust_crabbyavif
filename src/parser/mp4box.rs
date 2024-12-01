@@ -68,14 +68,25 @@ impl FileTypeBox {
     }
 
     pub fn is_avif(&self) -> bool {
+        let enable_avif = true;
+        #[cfg(android_soong)]
+        let enable_avif =
+            rustutils::system_properties::read_bool("media.crabbyavif.enable.avif.decode", false)
+                .unwrap_or(false);
         // "avio" also exists but does not identify the file as AVIF on its own. See
         // https://aomediacodec.github.io/av1-avif/v1.1.0.html#image-and-image-collection-brand
-        self.has_brand_any(&[
-            "avif",
-            "avis",
-            #[cfg(feature = "heic")]
-            "heic",
-        ])
+        if self.has_brand_any(&["avif", "avis"]) && enable_avif {
+            return true;
+        }
+        match (cfg!(feature = "heic"), cfg!(android_soong)) {
+            (false, _) => false,
+            (true, false) => self.has_brand("heic"),
+            (true, true) => {
+                // This is temporary. For the Android Framework, recognize HEIC files only if they
+                // also contain a gainmap.
+                self.has_brand("heic") && self.has_tmap()
+            }
+        }
     }
 
     pub fn needs_meta(&self) -> bool {
