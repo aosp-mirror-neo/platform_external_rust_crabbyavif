@@ -233,7 +233,8 @@ impl Image {
     pub fn channel_count(&self) -> u32 {
         match self.format {
             Format::Rgba | Format::Bgra | Format::Argb | Format::Abgr => 4,
-            Format::Rgb | Format::Bgr | Format::Rgb565 => 3,
+            Format::Rgb | Format::Bgr => 3,
+            Format::Rgb565 => 2,
             Format::Rgba1010102 => 0, // This is never used.
         }
     }
@@ -338,8 +339,9 @@ impl Image {
         }
         if matches!(
             image.yuv_format,
-            PixelFormat::AndroidP010 | PixelFormat::AndroidNv12 | PixelFormat::AndroidNv21
-        ) {
+            PixelFormat::AndroidNv12 | PixelFormat::AndroidNv21
+        ) | matches!(self.format, Format::Rgba1010102)
+        {
             // These conversions are only supported via libyuv.
             // TODO: b/362984605 - Handle alpha channel for these formats.
             if converted_with_libyuv {
