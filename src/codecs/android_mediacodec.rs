@@ -45,7 +45,7 @@ macro_rules! c_str {
 
 #[derive(Debug, Default)]
 struct PlaneInfo {
-    color_format: i32,
+    color_format: AndroidMediaCodecOutputColorFormat,
     offset: [isize; 3],
     row_stride: [u32; 3],
     column_stride: [u32; 3],
@@ -54,8 +54,8 @@ struct PlaneInfo {
 impl PlaneInfo {
     fn pixel_format(&self) -> PixelFormat {
         match self.color_format {
-            MediaCodec::YUV_P010 => PixelFormat::AndroidP010,
-            _ => {
+            AndroidMediaCodecOutputColorFormat::P010 => PixelFormat::AndroidP010,
+            AndroidMediaCodecOutputColorFormat::Yuv420Flexible => {
                 let u_before_v = self.offset[2] == self.offset[1] + 1;
                 let v_before_u = self.offset[1] == self.offset[2] + 1;
                 let is_nv_format = self.column_stride == [1, 2, 2] && (u_before_v || v_before_u);
@@ -70,8 +70,8 @@ impl PlaneInfo {
 
     fn depth(&self) -> u8 {
         match self.color_format {
-            MediaCodec::YUV_P010 => 10,
-            _ => 8,
+            AndroidMediaCodecOutputColorFormat::P010 => 16,
+            AndroidMediaCodecOutputColorFormat::Yuv420Flexible => 8,
         }
     }
 }
@@ -130,13 +130,13 @@ impl MediaFormat {
         let height = self.height()?;
         let slice_height = self.slice_height().unwrap_or(height);
         let stride = self.stride()?;
-        let color_format = self.color_format()?;
+        let color_format: AndroidMediaCodecOutputColorFormat = self.color_format()?.into();
         let mut plane_info = PlaneInfo {
             color_format,
             ..Default::default()
         };
         match color_format {
-            MediaCodec::YUV_P010 => {
+            AndroidMediaCodecOutputColorFormat::P010 => {
                 plane_info.row_stride = [
                     u32_from_i32(stride)?,
                     u32_from_i32(stride)?,
@@ -151,7 +151,7 @@ impl MediaFormat {
                     0, // V plane is not used for P010.
                 ];
             }
-            _ => {
+            AndroidMediaCodecOutputColorFormat::Yuv420Flexible => {
                 plane_info.row_stride = [
                     u32_from_i32(stride)?,
                     u32_from_i32((stride + 1) / 2)?,
@@ -198,7 +198,7 @@ impl MediaFormat {
             }
             let planes = unsafe { ptr::read_unaligned(ptr::addr_of!(image_data.mPlane)) };
             let mut plane_info = PlaneInfo {
-                color_format: self.color_format()?,
+                color_format: self.color_format()?.into(),
                 ..Default::default()
             };
             for plane_index in 0usize..3 {
@@ -223,14 +223,25 @@ fn prefer_hardware_decoder(config: &DecoderConfig) -> bool {
         false,
     )
     .unwrap_or(false);
-    // We will return true when all of the below conditions are true:
-    // 1) prefer_hw is true.
-    // 2) category is not Alpha. We do not prefer hardware for decoding the alpha plane since
-    //    they generally tend to be monochrome images and using hardware for that is
-    //    unreliable.
-    // 3) profile is 0. As of Sep 2024, there are no AV1 hardware decoders that support
-    //    anything other than profile 0.
-    prefer_hw && config.category != Category::Alpha && config.codec_config.profile() == 0
+    if config.codec_config.is_avif() {
+        // We will return true when all of the below conditions are true:
+        // 1) prefer_hw is true.
+        // 2) category is not Alpha and category is not Gainmap. We do not prefer hardware for
+        //    decoding these categories since they generally tend to be monochrome images and using
+        //    hardware for that is unreliable.
+        // 3) profile is 0. As of Sep 2024, there are no AV1 hardware decoders that support
+        //    anything other than profile 0.
+        prefer_hw
+            && config.category != Category::Alpha
+            && config.category != Category::Gainmap
+            && config.codec_config.profile() == 0
+    } else {
+        // We will return true when one of the following conditions are true:
+        // 1) prefer_hw is true.
+        // 2) depth is greater than 8. As of Nov 2024, the default HEVC software decoder on Android
+        //    only supports 8-bit images.
+        prefer_hw || config.depth > 8
+    }
 }
 
 fn get_codec_initializers(config: &DecoderConfig) -> Vec<CodecInitializer> {
@@ -297,12 +308,6 @@ pub struct MediaCodec {
 }
 
 impl MediaCodec {
-    // Flexible YUV 420 format used for 8-bit images:
-    // https://developer.android.com/reference/android/media/MediaCodecInfo.CodecCapabilities#COLOR_FormatYUV420Flexible
-    const YUV_420_FLEXIBLE: i32 = 2135033992;
-    // YUV P010 format used for 10-bit images:
-    // https://developer.android.com/reference/android/media/MediaCodecInfo.CodecCapabilities#COLOR_FormatYUVP010
-    const YUV_P010: i32 = 54;
     const AV1_MIME: &str = "video/av01";
     const HEVC_MIME: &str = "video/hevc";
 }
@@ -332,7 +337,11 @@ impl Decoder for MediaCodec {
             AMediaFormat_setInt32(
                 format,
                 AMEDIAFORMAT_KEY_COLOR_FORMAT,
-                if config.depth == 10 { Self::YUV_P010 } else { Self::YUV_420_FLEXIBLE },
+                if config.depth == 8 {
+                    AndroidMediaCodecOutputColorFormat::Yuv420Flexible
+                } else {
+                    AndroidMediaCodecOutputColorFormat::P010
+                } as i32,
             );
             // low-latency is documented but isn't exposed as a constant in the NDK:
             // https://developer.android.com/reference/android/media/MediaFormat#KEY_LOW_LATENCY
@@ -415,54 +424,65 @@ impl Decoder for MediaCodec {
                 AMediaCodec_releaseOutputBuffer(codec, self.output_buffer_index.unwrap(), false);
             }
         }
+        let mut retry_count = 0;
         unsafe {
-            let input_index = AMediaCodec_dequeueInputBuffer(codec, 0);
-            if input_index >= 0 {
-                let mut input_buffer_size: usize = 0;
-                let input_buffer = AMediaCodec_getInputBuffer(
-                    codec,
-                    input_index as usize,
-                    &mut input_buffer_size as *mut _,
-                );
-                if input_buffer.is_null() {
-                    return Err(AvifError::UnknownError(format!(
-                        "input buffer at index {input_index} was null"
-                    )));
-                }
-                let hevc_whole_nal_units = self.hevc_whole_nal_units(payload)?;
-                let codec_payload = match &hevc_whole_nal_units {
-                    Some(hevc_payload) => hevc_payload,
-                    None => payload,
-                };
-                if input_buffer_size < codec_payload.len() {
-                    return Err(AvifError::UnknownError(format!(
+            while retry_count < 100 {
+                retry_count += 1;
+                let input_index = AMediaCodec_dequeueInputBuffer(codec, 10000);
+                if input_index >= 0 {
+                    let mut input_buffer_size: usize = 0;
+                    let input_buffer = AMediaCodec_getInputBuffer(
+                        codec,
+                        input_index as usize,
+                        &mut input_buffer_size as *mut _,
+                    );
+                    if input_buffer.is_null() {
+                        return Err(AvifError::UnknownError(format!(
+                            "input buffer at index {input_index} was null"
+                        )));
+                    }
+                    let hevc_whole_nal_units = self.hevc_whole_nal_units(payload)?;
+                    let codec_payload = match &hevc_whole_nal_units {
+                        Some(hevc_payload) => hevc_payload,
+                        None => payload,
+                    };
+                    if input_buffer_size < codec_payload.len() {
+                        return Err(AvifError::UnknownError(format!(
                         "input buffer (size {input_buffer_size}) was not big enough. required size: {}",
                         codec_payload.len()
                     )));
-                }
-                ptr::copy_nonoverlapping(codec_payload.as_ptr(), input_buffer, codec_payload.len());
+                    }
+                    ptr::copy_nonoverlapping(
+                        codec_payload.as_ptr(),
+                        input_buffer,
+                        codec_payload.len(),
+                    );
 
-                if AMediaCodec_queueInputBuffer(
-                    codec,
-                    usize_from_isize(input_index)?,
-                    /*offset=*/ 0,
-                    codec_payload.len(),
-                    /*pts=*/ 0,
-                    /*flags=*/ 0,
-                ) != media_status_t_AMEDIA_OK
-                {
-                    return Err(AvifError::UnknownError("".into()));
+                    if AMediaCodec_queueInputBuffer(
+                        codec,
+                        usize_from_isize(input_index)?,
+                        /*offset=*/ 0,
+                        codec_payload.len(),
+                        /*pts=*/ 0,
+                        /*flags=*/ 0,
+                    ) != media_status_t_AMEDIA_OK
+                    {
+                        return Err(AvifError::UnknownError("".into()));
+                    }
+                    break;
+                } else if input_index == AMEDIACODEC_INFO_TRY_AGAIN_LATER as isize {
+                    continue;
+                } else {
+                    return Err(AvifError::UnknownError(format!(
+                        "got input index < 0: {input_index}"
+                    )));
                 }
-            } else {
-                return Err(AvifError::UnknownError(format!(
-                    "got input index < 0: {input_index}"
-                )));
             }
         }
         let mut buffer: Option<*mut u8> = None;
         let mut buffer_size: usize = 0;
-        let mut retry_count = 0;
         let mut buffer_info = AMediaCodecBufferInfo::default();
+        retry_count = 0;
         while retry_count < 100 {
             retry_count += 1;
             unsafe {

@@ -135,9 +135,15 @@ pub enum ImageContentType {
 }
 
 impl ImageContentType {
-    pub fn color_and_alpha(&self) -> bool {
-        matches!(self, Self::ColorAndAlpha | Self::All)
+    pub fn categories(&self) -> Vec<Category> {
+        match self {
+            Self::None => vec![],
+            Self::ColorAndAlpha => vec![Category::Color, Category::Alpha],
+            Self::GainMap => vec![Category::Gainmap],
+            Self::All => Category::ALL.to_vec(),
+        }
     }
+
     pub fn gainmap(&self) -> bool {
         matches!(self, Self::GainMap | Self::All)
     }
@@ -157,6 +163,7 @@ pub struct Settings {
     pub image_dimension_limit: u32,
     pub image_count_limit: u32,
     pub max_threads: u32,
+    pub android_mediacodec_output_color_format: AndroidMediaCodecOutputColorFormat,
 }
 
 impl Default for Settings {
@@ -174,6 +181,7 @@ impl Default for Settings {
             image_dimension_limit: DEFAULT_IMAGE_DIMENSION_LIMIT,
             image_count_limit: DEFAULT_IMAGE_COUNT_LIMIT,
             max_threads: 1,
+            android_mediacodec_output_color_format: AndroidMediaCodecOutputColorFormat::default(),
         }
     }
 }
@@ -431,15 +439,13 @@ impl Decoder {
             }
         }
 
-        // Make up an alpha item for convenience.
-        // TODO(yguyon): Find another item id if max is used.
-        let alpha_item_id = self
-            .items
-            .keys()
-            .max()
-            .unwrap()
-            .checked_add(1)
-            .ok_or(AvifError::NotImplemented)?;
+        // Make up an alpha item for convenience. For the item_id, choose the first id that is not
+        // found in the actual image. In the very unlikely case that all the item ids are used,
+        // treat this as an image without alpha channel.
+        let alpha_item_id = match (1..u32::MAX).find(|&id| !self.items.contains_key(&id)) {
+            Some(id) => id,
+            None => return Ok(None),
+        };
         let first_item = self.items.get(&alpha_item_indices[0]).unwrap();
         let properties = match first_item.codec_config() {
             Some(config) => vec![ItemProperty::CodecConfiguration(config.clone())],
@@ -540,6 +546,9 @@ impl Decoder {
             self.gainmap.alt_plane_count = pixi.plane_depths.len() as u8;
             self.gainmap.alt_plane_depth = pixi.plane_depths[0];
         }
+        // HEIC files created by Apple have some of these properties set in the Tonemap item. So do
+        // not perform this validation when HEIC is enabled.
+        #[cfg(not(feature = "heic"))]
         if find_property!(tonemap_item.properties, PixelAspectRatio).is_some()
             || find_property!(tonemap_item.properties, CleanAperture).is_some()
             || find_property!(tonemap_item.properties, ImageRotation).is_some()
@@ -683,7 +692,7 @@ impl Decoder {
             if dimg_item.dimg_for_id != item_id {
                 continue;
             }
-            if dimg_item.item_type != "av01" || dimg_item.has_unsupported_essential_property {
+            if !dimg_item.is_image_codec_item() || dimg_item.has_unsupported_essential_property {
                 return Err(AvifError::InvalidImageGrid(
                     "invalid input item in dimg grid".into(),
                 ));
@@ -1157,6 +1166,9 @@ impl Decoder {
             max_input_size: tile.max_sample_size(),
             codec_config: tile.codec_config.clone(),
             category,
+            android_mediacodec_output_color_format: self
+                .settings
+                .android_mediacodec_output_color_format,
         };
         codec.initialize(&config)?;
         self.codecs.push(codec);
@@ -1174,7 +1186,7 @@ impl Decoder {
             //  2) If android_mediacodec is true, then we will use at most three codec instances
             //     (one for each category).
             self.codecs = create_vec_exact(3)?;
-            for category in Category::ALL {
+            for category in self.settings.image_content_to_decode.categories() {
                 if self.tiles[category.usize()].is_empty() {
                     continue;
                 }
@@ -1193,7 +1205,7 @@ impl Decoder {
             }
         } else {
             self.codecs = create_vec_exact(self.tiles.iter().map(|tiles| tiles.len()).sum())?;
-            for category in Category::ALL {
+            for category in self.settings.image_content_to_decode.categories() {
                 for tile_index in 0..self.tiles[category.usize()].len() {
                     self.create_codec(category, tile_index)?;
                     self.tiles[category.usize()][tile_index].codec_index = self.codecs.len() - 1;
@@ -1259,7 +1271,7 @@ impl Decoder {
     }
 
     fn prepare_samples(&mut self, image_index: usize) -> AvifResult<()> {
-        for category in Category::ALL {
+        for category in self.settings.image_content_to_decode.categories() {
             for tile_index in 0..self.tiles[category.usize()].len() {
                 self.prepare_sample(image_index, category, tile_index, None)?;
             }
@@ -1447,13 +1459,7 @@ impl Decoder {
 
     fn decode_tiles(&mut self, image_index: usize) -> AvifResult<()> {
         let mut decoded_something = false;
-        for category in Category::ALL {
-            if !self.settings.image_content_to_decode.color_and_alpha()
-                && (category == Category::Color || category == Category::Alpha)
-            {
-                continue;
-            }
-
+        for category in self.settings.image_content_to_decode.categories() {
             let previous_decoded_tile_count =
                 self.tile_info[category.usize()].decoded_tile_count as usize;
             let tile_count = self.tiles[category.usize()].len();
@@ -1495,8 +1501,8 @@ impl Decoder {
         if !self.parsing_complete() {
             return false;
         }
-        for category in Category::ALL_USIZE {
-            if !self.tile_info[category].is_fully_decoded() {
+        for category in self.settings.image_content_to_decode.categories() {
+            if !self.tile_info[category.usize()].is_fully_decoded() {
                 return false;
             }
         }
