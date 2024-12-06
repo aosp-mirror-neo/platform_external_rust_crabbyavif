@@ -1,4 +1,4 @@
-name: Clippy
+name: TOML Formatter
 on:
   push:
     branches:
@@ -14,19 +14,11 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  clippy:
-    name: "Clippy"
+  toml-formatter:
+    name: "TOML Formatter"
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
-
-    - uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
-      with:
-        toolchain: stable
-
-    - name: Run clippy
-      run: cargo clippy --no-default-features -- -Dwarnings
-
-    - name: Run clippy with C API
-      run: cargo clippy --no-default-features --features=capi -- -Dwarnings
+    - uses: uncenter/setup-taplo@v1
+    - run: taplo fmt --check

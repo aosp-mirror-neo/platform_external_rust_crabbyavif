@@ -48,20 +48,18 @@ pub struct avifDecoder {
     pub duration: f64,
     pub durationInTimescales: u64,
     pub repetitionCount: i32,
-
     pub alphaPresent: avifBool,
-
     pub ioStats: IOStats,
     pub diag: avifDiagnostics,
-    //avifIO * io;
     pub data: *mut avifDecoderData,
-    pub gainMapPresent: avifBool,
-    pub enableDecodingGainMap: avifBool,
-    pub enableParsingGainMapMetadata: avifBool,
-    // avifBool ignoreColorAndAlpha;
+    pub imageContentToDecode: avifImageContentTypeFlags,
     pub imageSequenceTrackPresent: avifBool,
 
-    // TODO: maybe wrap these fields in a private data kind of field?
+    // These fields are not part of libavif. Any new fields that are to be header file compatible
+    // with libavif must be added before this line.
+    pub androidMediaCodecOutputColorFormat: AndroidMediaCodecOutputColorFormat,
+
+    // Rust specific fields that are not accessed from the C/C++ layer.
     rust_decoder: Box<Decoder>,
     image_object: avifImage,
     gainmap_object: avifGainMap,
@@ -95,10 +93,9 @@ impl Default for avifDecoder {
             ioStats: Default::default(),
             diag: avifDiagnostics::default(),
             data: std::ptr::null_mut(),
-            gainMapPresent: AVIF_FALSE,
-            enableDecodingGainMap: AVIF_FALSE,
-            enableParsingGainMapMetadata: AVIF_FALSE,
+            imageContentToDecode: AVIF_IMAGE_CONTENT_COLOR_AND_ALPHA,
             imageSequenceTrackPresent: AVIF_FALSE,
+            androidMediaCodecOutputColorFormat: AndroidMediaCodecOutputColorFormat::default(),
             rust_decoder: Box::<Decoder>::default(),
             image_object: avifImage::default(),
             gainmap_image_object: avifImage::default(),
@@ -139,7 +136,7 @@ pub unsafe extern "C" fn crabby_avifDecoderSetIOMemory(
     size: usize,
 ) -> avifResult {
     let rust_decoder = unsafe { &mut (*decoder).rust_decoder };
-    to_avifResult(&rust_decoder.set_io_raw(data, size))
+    to_avifResult(unsafe { &rust_decoder.set_io_raw(data, size) })
 }
 
 #[no_mangle]
@@ -150,7 +147,6 @@ pub unsafe extern "C" fn crabby_avifDecoderSetSource(
     unsafe {
         (*decoder).requestedSource = source;
     }
-    // TODO: should decoder be reset here in case this is called after parse?
     avifResult::Ok
 }
 
@@ -173,6 +169,12 @@ impl From<&avifDecoder> for Settings {
             }
             Strictness::SpecificInclude(flags)
         };
+        let image_content_to_decode_flags: ImageContentType = match decoder.imageContentToDecode {
+            AVIF_IMAGE_CONTENT_ALL => ImageContentType::All,
+            AVIF_IMAGE_CONTENT_COLOR_AND_ALPHA => ImageContentType::ColorAndAlpha,
+            AVIF_IMAGE_CONTENT_GAIN_MAP => ImageContentType::GainMap,
+            _ => ImageContentType::None,
+        };
         Self {
             source: decoder.requestedSource,
             strictness,
@@ -180,8 +182,7 @@ impl From<&avifDecoder> for Settings {
             allow_incremental: decoder.allowIncremental == AVIF_TRUE,
             ignore_exif: decoder.ignoreExif == AVIF_TRUE,
             ignore_xmp: decoder.ignoreXMP == AVIF_TRUE,
-            enable_decoding_gainmap: decoder.enableDecodingGainMap == AVIF_TRUE,
-            enable_parsing_gainmap_metadata: decoder.enableParsingGainMapMetadata == AVIF_TRUE,
+            image_content_to_decode: image_content_to_decode_flags,
             codec_choice: match decoder.codecChoice {
                 avifCodecChoice::Auto => CodecChoice::Auto,
                 avifCodecChoice::Dav1d => CodecChoice::Dav1d,
@@ -193,6 +194,7 @@ impl From<&avifDecoder> for Settings {
             image_dimension_limit: decoder.imageDimensionLimit,
             image_count_limit: decoder.imageCountLimit,
             max_threads: u32::try_from(decoder.maxThreads).unwrap_or(0),
+            android_mediacodec_output_color_format: decoder.androidMediaCodecOutputColorFormat,
         }
     }
 }
@@ -209,7 +211,7 @@ fn rust_decoder_to_avifDecoder(src: &Decoder, dst: &mut avifDecoder) {
 
     dst.imageTiming = src.image_timing();
     dst.imageCount = src.image_count() as i32;
-    dst.imageIndex = src.image_index() as i32;
+    dst.imageIndex = src.image_index();
     dst.repetitionCount = match src.repetition_count() {
         RepetitionCount::Unknown => AVIF_REPETITION_COUNT_UNKNOWN,
         RepetitionCount::Infinite => AVIF_REPETITION_COUNT_INFINITE,
@@ -221,10 +223,11 @@ fn rust_decoder_to_avifDecoder(src: &Decoder, dst: &mut avifDecoder) {
     dst.ioStats = src.io_stats();
 
     if src.gainmap_present() {
-        dst.gainMapPresent = AVIF_TRUE;
         dst.gainmap_image_object = (&src.gainmap().image).into();
         dst.gainmap_object = src.gainmap().into();
-        dst.gainmap_object.image = (&mut dst.gainmap_image_object) as *mut avifImage;
+        if src.settings.image_content_to_decode.gainmap() {
+            dst.gainmap_object.image = (&mut dst.gainmap_image_object) as *mut avifImage;
+        }
         dst.image_object.gainMap = (&mut dst.gainmap_object) as *mut avifGainMap;
     }
     dst.image = (&mut dst.image_object) as *mut avifImage;
@@ -262,11 +265,7 @@ pub unsafe extern "C" fn crabby_avifDecoderNextImage(decoder: *mut avifDecoder) 
             if rust_decoder.settings.allow_incremental
                 && matches!(res.as_ref().err().unwrap(), AvifError::WaitingOnIo)
             {
-                if previous_decoded_row_count != rust_decoder.decoded_row_count() {
-                    early_return = false;
-                } else {
-                    early_return = true;
-                }
+                early_return = previous_decoded_row_count == rust_decoder.decoded_row_count();
             }
         }
         if early_return {
@@ -299,10 +298,8 @@ pub unsafe extern "C" fn crabby_avifDecoderNthImage(
             {
                 if image_index != frameIndex {
                     early_return = false;
-                } else if previous_decoded_row_count != rust_decoder.decoded_row_count() {
-                    early_return = false;
                 } else {
-                    early_return = true;
+                    early_return = previous_decoded_row_count == rust_decoder.decoded_row_count();
                 }
             }
         }

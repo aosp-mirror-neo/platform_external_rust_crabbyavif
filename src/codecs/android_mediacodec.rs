@@ -18,6 +18,7 @@ use crate::decoder::Category;
 use crate::image::Image;
 use crate::image::YuvRange;
 use crate::internal_utils::pixels::*;
+use crate::internal_utils::stream::IStream;
 use crate::internal_utils::*;
 use crate::*;
 
@@ -27,11 +28,12 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::ptr;
 
-#[derive(Debug, Default)]
-pub struct MediaCodec {
-    codec: Option<*mut AMediaCodec>,
-    format: Option<*mut AMediaFormat>,
-    output_buffer_index: Option<usize>,
+#[cfg(android_soong)]
+include!(concat!(env!("OUT_DIR"), "/mediaimage2_bindgen.rs"));
+
+#[derive(Debug)]
+struct MediaFormat {
+    format: *mut AMediaFormat,
 }
 
 macro_rules! c_str {
@@ -41,42 +43,290 @@ macro_rules! c_str {
     };
 }
 
-fn get_i32(format: *mut AMediaFormat, key: *const c_char) -> Option<i32> {
-    let mut value: i32 = 0;
-    match unsafe { AMediaFormat_getInt32(format, key, &mut value as *mut _) } {
-        true => Some(value),
-        false => None,
+#[derive(Debug, Default)]
+struct PlaneInfo {
+    color_format: AndroidMediaCodecOutputColorFormat,
+    offset: [isize; 3],
+    row_stride: [u32; 3],
+    column_stride: [u32; 3],
+}
+
+impl PlaneInfo {
+    fn pixel_format(&self) -> PixelFormat {
+        match self.color_format {
+            AndroidMediaCodecOutputColorFormat::P010 => PixelFormat::AndroidP010,
+            AndroidMediaCodecOutputColorFormat::Yuv420Flexible => {
+                let u_before_v = self.offset[2] == self.offset[1] + 1;
+                let v_before_u = self.offset[1] == self.offset[2] + 1;
+                let is_nv_format = self.column_stride == [1, 2, 2] && (u_before_v || v_before_u);
+                match (is_nv_format, u_before_v) {
+                    (true, true) => PixelFormat::AndroidNv12,
+                    (true, false) => PixelFormat::AndroidNv21,
+                    (false, _) => PixelFormat::Yuv420,
+                }
+            }
+        }
+    }
+
+    fn depth(&self) -> u8 {
+        match self.color_format {
+            AndroidMediaCodecOutputColorFormat::P010 => 16,
+            AndroidMediaCodecOutputColorFormat::Yuv420Flexible => 8,
+        }
     }
 }
 
-fn get_i32_from_str(format: *mut AMediaFormat, key: &str) -> Option<i32> {
-    c_str!(key_str, key_str_tmp, key);
-    let mut value: i32 = 0;
-    match unsafe { AMediaFormat_getInt32(format, key_str, &mut value as *mut _) } {
-        true => Some(value),
-        false => None,
+impl MediaFormat {
+    fn get_i32(&self, key: *const c_char) -> Option<i32> {
+        let mut value: i32 = 0;
+        match unsafe { AMediaFormat_getInt32(self.format, key, &mut value as *mut _) } {
+            true => Some(value),
+            false => None,
+        }
     }
+
+    fn get_i32_from_str(&self, key: &str) -> Option<i32> {
+        c_str!(key_str, key_str_tmp, key);
+        self.get_i32(key_str)
+    }
+
+    fn width(&self) -> AvifResult<i32> {
+        self.get_i32(unsafe { AMEDIAFORMAT_KEY_WIDTH })
+            .ok_or(AvifError::UnknownError("".into()))
+    }
+
+    fn height(&self) -> AvifResult<i32> {
+        self.get_i32(unsafe { AMEDIAFORMAT_KEY_HEIGHT })
+            .ok_or(AvifError::UnknownError("".into()))
+    }
+
+    fn slice_height(&self) -> AvifResult<i32> {
+        self.get_i32(unsafe { AMEDIAFORMAT_KEY_SLICE_HEIGHT })
+            .ok_or(AvifError::UnknownError("".into()))
+    }
+
+    fn stride(&self) -> AvifResult<i32> {
+        self.get_i32(unsafe { AMEDIAFORMAT_KEY_STRIDE })
+            .ok_or(AvifError::UnknownError("".into()))
+    }
+
+    fn color_format(&self) -> AvifResult<i32> {
+        self.get_i32(unsafe { AMEDIAFORMAT_KEY_COLOR_FORMAT })
+            .ok_or(AvifError::UnknownError("".into()))
+    }
+
+    fn color_range(&self) -> YuvRange {
+        // color-range is documented but isn't exposed as a constant in the NDK:
+        // https://developer.android.com/reference/android/media/MediaFormat#KEY_COLOR_RANGE
+        let color_range = self.get_i32_from_str("color-range").unwrap_or(2);
+        if color_range == 0 {
+            YuvRange::Limited
+        } else {
+            YuvRange::Full
+        }
+    }
+
+    fn guess_plane_info(&self) -> AvifResult<PlaneInfo> {
+        let height = self.height()?;
+        let slice_height = self.slice_height().unwrap_or(height);
+        let stride = self.stride()?;
+        let color_format: AndroidMediaCodecOutputColorFormat = self.color_format()?.into();
+        let mut plane_info = PlaneInfo {
+            color_format,
+            ..Default::default()
+        };
+        match color_format {
+            AndroidMediaCodecOutputColorFormat::P010 => {
+                plane_info.row_stride = [
+                    u32_from_i32(stride)?,
+                    u32_from_i32(stride)?,
+                    0, // V plane is not used for P010.
+                ];
+                plane_info.column_stride = [
+                    2, 2, 0, // V plane is not used for P010.
+                ];
+                plane_info.offset = [
+                    0,
+                    isize_from_i32(stride * slice_height)?,
+                    0, // V plane is not used for P010.
+                ];
+            }
+            AndroidMediaCodecOutputColorFormat::Yuv420Flexible => {
+                plane_info.row_stride = [
+                    u32_from_i32(stride)?,
+                    u32_from_i32((stride + 1) / 2)?,
+                    u32_from_i32((stride + 1) / 2)?,
+                ];
+                plane_info.column_stride = [1, 1, 1];
+                plane_info.offset[0] = 0;
+                plane_info.offset[1] = isize_from_i32(stride * slice_height)?;
+                let u_plane_size = isize_from_i32(((stride + 1) / 2) * ((height + 1) / 2))?;
+                // When color format is YUV_420_FLEXIBLE, the V plane comes before the U plane.
+                plane_info.offset[2] = plane_info.offset[1] - u_plane_size;
+            }
+        }
+        Ok(plane_info)
+    }
+
+    fn get_plane_info(&self) -> AvifResult<PlaneInfo> {
+        // When not building for the Android platform, image-data is not available, so simply try to
+        // guess the buffer format based on the available keys in the format.
+        #[cfg(not(android_soong))]
+        return self.guess_plane_info();
+
+        #[cfg(android_soong)]
+        {
+            c_str!(key_str, key_str_tmp, "image-data");
+            let mut data: *mut std::ffi::c_void = ptr::null_mut();
+            let mut size: usize = 0;
+            if !unsafe {
+                AMediaFormat_getBuffer(
+                    self.format,
+                    key_str,
+                    &mut data as *mut _,
+                    &mut size as *mut _,
+                )
+            } {
+                return self.guess_plane_info();
+            }
+            if size != std::mem::size_of::<android_MediaImage2>() {
+                return self.guess_plane_info();
+            }
+            let image_data = unsafe { *(data as *const android_MediaImage2) };
+            if image_data.mType != android_MediaImage2_Type_MEDIA_IMAGE_TYPE_YUV {
+                return self.guess_plane_info();
+            }
+            let planes = unsafe { ptr::read_unaligned(ptr::addr_of!(image_data.mPlane)) };
+            let mut plane_info = PlaneInfo {
+                color_format: self.color_format()?.into(),
+                ..Default::default()
+            };
+            for plane_index in 0usize..3 {
+                plane_info.offset[plane_index] = isize_from_u32(planes[plane_index].mOffset)?;
+                plane_info.row_stride[plane_index] = u32_from_i32(planes[plane_index].mRowInc)?;
+                plane_info.column_stride[plane_index] = u32_from_i32(planes[plane_index].mColInc)?;
+            }
+            return Ok(plane_info);
+        }
+    }
+}
+
+enum CodecInitializer {
+    ByName(String),
+    ByMimeType(String),
+}
+
+#[cfg(android_soong)]
+fn prefer_hardware_decoder(config: &DecoderConfig) -> bool {
+    let prefer_hw = rustutils::system_properties::read_bool(
+        "media.stagefright.thumbnail.prefer_hw_codecs",
+        false,
+    )
+    .unwrap_or(false);
+    if config.codec_config.is_avif() {
+        // We will return true when all of the below conditions are true:
+        // 1) prefer_hw is true.
+        // 2) category is not Alpha and category is not Gainmap. We do not prefer hardware for
+        //    decoding these categories since they generally tend to be monochrome images and using
+        //    hardware for that is unreliable.
+        // 3) profile is 0. As of Sep 2024, there are no AV1 hardware decoders that support
+        //    anything other than profile 0.
+        prefer_hw
+            && config.category != Category::Alpha
+            && config.category != Category::Gainmap
+            && config.codec_config.profile() == 0
+    } else {
+        // We will return true when one of the following conditions are true:
+        // 1) prefer_hw is true.
+        // 2) depth is greater than 8. As of Nov 2024, the default HEVC software decoder on Android
+        //    only supports 8-bit images.
+        prefer_hw || config.depth > 8
+    }
+}
+
+fn get_codec_initializers(config: &DecoderConfig) -> Vec<CodecInitializer> {
+    #[cfg(android_soong)]
+    {
+        // Use a specific decoder if it is requested.
+        if let Ok(Some(decoder)) =
+            rustutils::system_properties::read("media.crabbyavif.debug.decoder")
+        {
+            if !decoder.is_empty() {
+                return vec![CodecInitializer::ByName(decoder)];
+            }
+        }
+    }
+    let dav1d = String::from("c2.android.av1-dav1d.decoder");
+    let gav1 = String::from("c2.android.av1.decoder");
+    let hevc = String::from("c2.android.hevc.decoder");
+    // As of Sep 2024, c2.android.av1.decoder is the only known decoder to support 12-bit AV1. So
+    // prefer that for 12 bit images.
+    let prefer_gav1 = config.depth == 12;
+    let is_avif = config.codec_config.is_avif();
+    let mime_type = if is_avif { MediaCodec::AV1_MIME } else { MediaCodec::HEVC_MIME };
+    let prefer_hw = false;
+    #[cfg(android_soong)]
+    let prefer_hw = prefer_hardware_decoder(config);
+    match (prefer_hw, is_avif, prefer_gav1) {
+        (true, false, _) => vec![
+            CodecInitializer::ByMimeType(mime_type.to_string()),
+            CodecInitializer::ByName(hevc),
+        ],
+        (false, false, _) => vec![
+            CodecInitializer::ByName(hevc),
+            CodecInitializer::ByMimeType(mime_type.to_string()),
+        ],
+        (true, true, true) => vec![
+            CodecInitializer::ByName(gav1),
+            CodecInitializer::ByMimeType(mime_type.to_string()),
+            CodecInitializer::ByName(dav1d),
+        ],
+        (true, true, false) => vec![
+            CodecInitializer::ByMimeType(mime_type.to_string()),
+            CodecInitializer::ByName(dav1d),
+            CodecInitializer::ByName(gav1),
+        ],
+        (false, true, true) => vec![
+            CodecInitializer::ByName(gav1),
+            CodecInitializer::ByName(dav1d),
+            CodecInitializer::ByMimeType(mime_type.to_string()),
+        ],
+        (false, true, false) => vec![
+            CodecInitializer::ByName(dav1d),
+            CodecInitializer::ByName(gav1),
+            CodecInitializer::ByMimeType(mime_type.to_string()),
+        ],
+    }
+}
+
+#[derive(Default)]
+pub struct MediaCodec {
+    codec: Option<*mut AMediaCodec>,
+    format: Option<MediaFormat>,
+    output_buffer_index: Option<usize>,
+    config: Option<DecoderConfig>,
+}
+
+impl MediaCodec {
+    const AV1_MIME: &str = "video/av01";
+    const HEVC_MIME: &str = "video/hevc";
 }
 
 impl Decoder for MediaCodec {
     fn initialize(&mut self, config: &DecoderConfig) -> AvifResult<()> {
-        // Does not support operating point and all layers.
         if self.codec.is_some() {
             return Ok(()); // Already initialized.
-        }
-        //c_str!(codec_mime_type, codec_mime_type_tmp, "video/av01");
-        //let codec = unsafe { AMediaCodec_createDecoderByType(codec_mime_type) };
-        c_str!(codec_name, codec_name_tmp, "c2.android.av1.decoder");
-        let codec = unsafe { AMediaCodec_createCodecByName(codec_name) };
-        if codec.is_null() {
-            return Err(AvifError::NoCodecAvailable);
         }
         let format = unsafe { AMediaFormat_new() };
         if format.is_null() {
             return Err(AvifError::UnknownError("".into()));
         }
+        c_str!(
+            mime_type,
+            mime_type_tmp,
+            if config.codec_config.is_avif() { Self::AV1_MIME } else { Self::HEVC_MIME }
+        );
         unsafe {
-            c_str!(mime_type, mime_type_tmp, "video/av01");
             AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, mime_type);
             AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, i32_from_u32(config.width)?);
             AMediaFormat_setInt32(
@@ -84,33 +334,82 @@ impl Decoder for MediaCodec {
                 AMEDIAFORMAT_KEY_HEIGHT,
                 i32_from_u32(config.height)?,
             );
-
-            // https://developer.android.com/reference/android/media/MediaCodecInfo.CodecCapabilities#COLOR_FormatYUV420Flexible
-            //AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_COLOR_FORMAT, 2135033992);
-            AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_COLOR_FORMAT, 19);
-
-            // TODO: for 10-bit need to set format to 54 in order to get 10-bit
-            // output. Or maybe it is possible to get RGB 1010102 itself?
-            // int32_t COLOR_FormatYUVP010 = 54;
-            // rgb 1010102 = 2130750114
-
-            if AMediaCodec_configure(codec, format, ptr::null_mut(), ptr::null_mut(), 0)
-                != media_status_t_AMEDIA_OK
-            {
-                return Err(AvifError::NoCodecAvailable);
+            AMediaFormat_setInt32(
+                format,
+                AMEDIAFORMAT_KEY_COLOR_FORMAT,
+                if config.depth == 8 {
+                    AndroidMediaCodecOutputColorFormat::Yuv420Flexible
+                } else {
+                    AndroidMediaCodecOutputColorFormat::P010
+                } as i32,
+            );
+            // low-latency is documented but isn't exposed as a constant in the NDK:
+            // https://developer.android.com/reference/android/media/MediaFormat#KEY_LOW_LATENCY
+            c_str!(low_latency, low_latency_tmp, "low-latency");
+            AMediaFormat_setInt32(format, low_latency, 1);
+            AMediaFormat_setInt32(
+                format,
+                AMEDIAFORMAT_KEY_MAX_INPUT_SIZE,
+                i32_from_usize(config.max_input_size)?,
+            );
+            let codec_specific_data = config.codec_config.raw_data();
+            if !codec_specific_data.is_empty() {
+                AMediaFormat_setBuffer(
+                    format,
+                    AMEDIAFORMAT_KEY_CSD_0,
+                    codec_specific_data.as_ptr() as *const _,
+                    codec_specific_data.len(),
+                );
             }
-            if AMediaCodec_start(codec) != media_status_t_AMEDIA_OK {
-                return Err(AvifError::NoCodecAvailable);
+        }
+
+        let mut codec = ptr::null_mut();
+        for codec_initializer in get_codec_initializers(config) {
+            codec = match codec_initializer {
+                CodecInitializer::ByName(name) => {
+                    c_str!(codec_name, codec_name_tmp, name.as_str());
+                    unsafe { AMediaCodec_createCodecByName(codec_name) }
+                }
+                CodecInitializer::ByMimeType(mime_type) => {
+                    c_str!(codec_mime, codec_mime_tmp, mime_type.as_str());
+                    unsafe { AMediaCodec_createDecoderByType(codec_mime) }
+                }
+            };
+            if codec.is_null() {
+                continue;
             }
-            AMediaFormat_delete(format);
+            let status = unsafe {
+                AMediaCodec_configure(codec, format, ptr::null_mut(), ptr::null_mut(), 0)
+            };
+            if status != media_status_t_AMEDIA_OK {
+                unsafe {
+                    AMediaCodec_delete(codec);
+                }
+                codec = ptr::null_mut();
+                continue;
+            }
+            let status = unsafe { AMediaCodec_start(codec) };
+            if status != media_status_t_AMEDIA_OK {
+                unsafe {
+                    AMediaCodec_delete(codec);
+                }
+                codec = ptr::null_mut();
+                continue;
+            }
+            break;
+        }
+        if codec.is_null() {
+            unsafe { AMediaFormat_delete(format) };
+            return Err(AvifError::NoCodecAvailable);
         }
         self.codec = Some(codec);
+        self.config = Some(config.clone());
         Ok(())
     }
 
     fn get_next_image(
         &mut self,
-        av1_payload: &[u8],
+        payload: &[u8],
         _spatial_id: u8,
         image: &mut Image,
         category: Category,
@@ -125,43 +424,65 @@ impl Decoder for MediaCodec {
                 AMediaCodec_releaseOutputBuffer(codec, self.output_buffer_index.unwrap(), false);
             }
         }
+        let mut retry_count = 0;
         unsafe {
-            let input_index = AMediaCodec_dequeueInputBuffer(codec, 0);
-            if input_index >= 0 {
-                let mut input_buffer_size: usize = 0;
-                let input_buffer = AMediaCodec_getInputBuffer(
-                    codec,
-                    input_index as usize,
-                    &mut input_buffer_size as *mut _,
-                );
-                if input_buffer.is_null() {
+            while retry_count < 100 {
+                retry_count += 1;
+                let input_index = AMediaCodec_dequeueInputBuffer(codec, 10000);
+                if input_index >= 0 {
+                    let mut input_buffer_size: usize = 0;
+                    let input_buffer = AMediaCodec_getInputBuffer(
+                        codec,
+                        input_index as usize,
+                        &mut input_buffer_size as *mut _,
+                    );
+                    if input_buffer.is_null() {
+                        return Err(AvifError::UnknownError(format!(
+                            "input buffer at index {input_index} was null"
+                        )));
+                    }
+                    let hevc_whole_nal_units = self.hevc_whole_nal_units(payload)?;
+                    let codec_payload = match &hevc_whole_nal_units {
+                        Some(hevc_payload) => hevc_payload,
+                        None => payload,
+                    };
+                    if input_buffer_size < codec_payload.len() {
+                        return Err(AvifError::UnknownError(format!(
+                        "input buffer (size {input_buffer_size}) was not big enough. required size: {}",
+                        codec_payload.len()
+                    )));
+                    }
+                    ptr::copy_nonoverlapping(
+                        codec_payload.as_ptr(),
+                        input_buffer,
+                        codec_payload.len(),
+                    );
+
+                    if AMediaCodec_queueInputBuffer(
+                        codec,
+                        usize_from_isize(input_index)?,
+                        /*offset=*/ 0,
+                        codec_payload.len(),
+                        /*pts=*/ 0,
+                        /*flags=*/ 0,
+                    ) != media_status_t_AMEDIA_OK
+                    {
+                        return Err(AvifError::UnknownError("".into()));
+                    }
+                    break;
+                } else if input_index == AMEDIACODEC_INFO_TRY_AGAIN_LATER as isize {
+                    continue;
+                } else {
                     return Err(AvifError::UnknownError(format!(
-                        "input buffer at index {input_index} was null"
+                        "got input index < 0: {input_index}"
                     )));
                 }
-                // TODO: Alternative is to create a slice from raw parts and use copy_from_slice.
-                ptr::copy_nonoverlapping(av1_payload.as_ptr(), input_buffer, av1_payload.len());
-                if AMediaCodec_queueInputBuffer(
-                    codec,
-                    usize_from_isize(input_index)?,
-                    /*offset=*/ 0,
-                    av1_payload.len(),
-                    /*pts=*/ 0,
-                    /*flags=*/ 0,
-                ) != media_status_t_AMEDIA_OK
-                {
-                    return Err(AvifError::UnknownError("".into()));
-                }
-            } else {
-                return Err(AvifError::UnknownError(format!(
-                    "got input index < 0: {input_index}"
-                )));
             }
         }
         let mut buffer: Option<*mut u8> = None;
         let mut buffer_size: usize = 0;
-        let mut retry_count = 0;
         let mut buffer_info = AMediaCodecBufferInfo::default();
+        retry_count = 0;
         while retry_count < 100 {
             retry_count += 1;
             unsafe {
@@ -180,14 +501,13 @@ impl Decoder for MediaCodec {
                     self.output_buffer_index = Some(usize_from_isize(output_index)?);
                     break;
                 } else if output_index == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED as isize {
-                    // TODO: what to do?
                     continue;
                 } else if output_index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED as isize {
                     let format = AMediaCodec_getOutputFormat(codec);
                     if format.is_null() {
                         return Err(AvifError::UnknownError("output format was null".into()));
                     }
-                    self.format = Some(format);
+                    self.format = Some(MediaFormat { format });
                     continue;
                 } else if output_index == AMEDIACODEC_INFO_TRY_AGAIN_LATER as isize {
                     continue;
@@ -207,72 +527,87 @@ impl Decoder for MediaCodec {
             return Err(AvifError::UnknownError("format is none".into()));
         }
         let buffer = buffer.unwrap();
-        let format = self.format.unwrap();
-        let width = get_i32(format, unsafe { AMEDIAFORMAT_KEY_WIDTH })
-            .ok_or(AvifError::UnknownError("".into()))?;
-        let height = get_i32(format, unsafe { AMEDIAFORMAT_KEY_HEIGHT })
-            .ok_or(AvifError::UnknownError("".into()))?;
-        let stride = get_i32(format, unsafe { AMEDIAFORMAT_KEY_STRIDE })
-            .ok_or(AvifError::UnknownError("".into()))?;
-        let color_format = get_i32(format, unsafe { AMEDIAFORMAT_KEY_COLOR_FORMAT })
-            .ok_or(AvifError::UnknownError("".into()))?;
-        // color-range is documented but the key variable is not exposed in the NDK:
-        // https://developer.android.com/reference/android/media/MediaFormat#KEY_COLOR_RANGE
-        let color_range = get_i32_from_str(format, "color-range").unwrap_or(2);
+        let format = self.format.unwrap_ref();
+        image.width = format.width()? as u32;
+        image.height = format.height()? as u32;
+        image.yuv_range = format.color_range();
+        let plane_info = format.get_plane_info()?;
+        image.depth = plane_info.depth();
+        image.yuv_format = plane_info.pixel_format();
         match category {
             Category::Alpha => {
                 // TODO: make sure alpha plane matches previous alpha plane.
-                image.width = width as u32;
-                image.height = height as u32;
-                image.depth = 8; // TODO: 10?
-                image.yuv_range = if color_range == 0 { YuvRange::Limited } else { YuvRange::Full };
-                image.planes[3] = Some(Pixels::Pointer(buffer));
-                image.row_bytes[3] = stride as u32;
+                image.row_bytes[3] = plane_info.row_stride[0];
+                image.planes[3] = Some(Pixels::from_raw_pointer(
+                    unsafe { buffer.offset(plane_info.offset[0]) },
+                    image.depth as u32,
+                    image.height,
+                    image.row_bytes[3],
+                )?);
             }
             _ => {
-                image.width = width as u32;
-                image.height = height as u32;
-                image.depth = 8; // TODO: 10?
-                let mut reverse_uv = true;
-                image.yuv_format = match color_format {
-                    // Android maps all AV1 8-bit images into yuv 420.
-                    2135033992 => PixelFormat::Yuv420,
-                    19 => {
-                        reverse_uv = false;
-                        PixelFormat::Yuv420
-                    }
-                    _ => {
-                        return Err(AvifError::UnknownError(format!(
-                            "unknown color format: {color_format}"
-                        )));
-                    }
-                };
-                image.yuv_range = if color_range == 0 { YuvRange::Limited } else { YuvRange::Full };
                 image.chroma_sample_position = ChromaSamplePosition::Unknown;
-
                 image.color_primaries = ColorPrimaries::Unspecified;
                 image.transfer_characteristics = TransferCharacteristics::Unspecified;
                 image.matrix_coefficients = MatrixCoefficients::Unspecified;
 
-                image.planes[0] = Some(Pixels::Pointer(buffer));
-                // TODO: u and v order must be inverted for color format 19.
-                let u_plane_offset = isize_from_i32(stride * height)?;
-                let u_index = if reverse_uv { 2 } else { 1 };
-                image.planes[u_index] =
-                    Some(Pixels::Pointer(unsafe { buffer.offset(u_plane_offset) }));
-                let u_plane_size = isize_from_i32(((width + 1) / 2) * ((height + 1) / 2))?;
-                let v_plane_offset = u_plane_offset + u_plane_size;
-                let v_index = if reverse_uv { 1 } else { 2 };
-                image.planes[v_index] =
-                    Some(Pixels::Pointer(unsafe { buffer.offset(v_plane_offset) }));
-
-                image.row_bytes[0] = stride as u32;
-                image.row_bytes[1] = ((stride + 1) / 2) as u32;
-                image.row_bytes[2] = ((stride + 1) / 2) as u32;
+                for i in 0usize..3 {
+                    if i == 2
+                        && matches!(
+                            image.yuv_format,
+                            PixelFormat::AndroidP010
+                                | PixelFormat::AndroidNv12
+                                | PixelFormat::AndroidNv21
+                        )
+                    {
+                        // V plane is not needed for these formats.
+                        break;
+                    }
+                    image.row_bytes[i] = plane_info.row_stride[i];
+                    let plane_height = if i == 0 { image.height } else { (image.height + 1) / 2 };
+                    image.planes[i] = Some(Pixels::from_raw_pointer(
+                        unsafe { buffer.offset(plane_info.offset[i]) },
+                        image.depth as u32,
+                        plane_height,
+                        image.row_bytes[i],
+                    )?);
+                }
             }
         }
-        // TODO: gainmap category.
         Ok(())
+    }
+}
+
+impl MediaCodec {
+    fn hevc_whole_nal_units(&self, payload: &[u8]) -> AvifResult<Option<Vec<u8>>> {
+        if !self.config.unwrap_ref().codec_config.is_heic() {
+            return Ok(None);
+        }
+        // For HEVC, MediaCodec expects whole NAL units with each unit prefixed with a start code
+        // of "\x00\x00\x00\x01".
+        let nal_length_size = self.config.unwrap_ref().codec_config.nal_length_size() as usize;
+        let mut offset = 0;
+        let mut hevc_payload = Vec::new();
+        while offset < payload.len() {
+            let payload_slice = &payload[offset..];
+            let mut stream = IStream::create(payload_slice);
+            let nal_length = usize_from_u64(stream.read_uxx(nal_length_size as u8)?)?;
+            let nal_unit_end = checked_add!(nal_length, nal_length_size)?;
+            let nal_unit_range = nal_length_size..nal_unit_end;
+            check_slice_range(payload_slice.len(), &nal_unit_range)?;
+            // Start code.
+            hevc_payload.extend_from_slice(&[0, 0, 0, 1]);
+            // NAL Unit.
+            hevc_payload.extend_from_slice(&payload_slice[nal_unit_range]);
+            offset = checked_add!(offset, nal_unit_end)?;
+        }
+        Ok(Some(hevc_payload))
+    }
+}
+
+impl Drop for MediaFormat {
+    fn drop(&mut self) {
+        unsafe { AMediaFormat_delete(self.format) };
     }
 }
 
@@ -295,9 +630,6 @@ impl Drop for MediaCodec {
             }
             self.codec = None;
         }
-        if self.format.is_some() {
-            unsafe { AMediaFormat_delete(self.format.unwrap()) };
-            self.format = None;
-        }
+        self.format = None;
     }
 }
