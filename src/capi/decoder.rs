@@ -58,7 +58,6 @@ pub struct avifDecoder {
     // These fields are not part of libavif. Any new fields that are to be header file compatible
     // with libavif must be added before this line.
     pub androidMediaCodecOutputColorFormat: AndroidMediaCodecOutputColorFormat,
-    pub compressionFormat: CompressionFormat,
 
     // Rust specific fields that are not accessed from the C/C++ layer.
     rust_decoder: Box<Decoder>,
@@ -97,7 +96,6 @@ impl Default for avifDecoder {
             imageContentToDecode: AVIF_IMAGE_CONTENT_COLOR_AND_ALPHA,
             imageSequenceTrackPresent: AVIF_FALSE,
             androidMediaCodecOutputColorFormat: AndroidMediaCodecOutputColorFormat::default(),
-            compressionFormat: CompressionFormat::default(),
             rust_decoder: Box::<Decoder>::default(),
             image_object: avifImage::default(),
             gainmap_image_object: avifImage::default(),
@@ -223,7 +221,6 @@ fn rust_decoder_to_avifDecoder(src: &Decoder, dst: &mut avifDecoder) {
     dst.durationInTimescales = src.duration_in_timescales();
     dst.duration = src.duration();
     dst.ioStats = src.io_stats();
-    dst.compressionFormat = src.compression_format();
 
     if src.gainmap_present() {
         dst.gainmap_image_object = (&src.gainmap().image).into();
