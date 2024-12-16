@@ -8,14 +8,14 @@ third_party {
   license_type: NOTICE
   last_upgrade_date {
     year: 2024
-    month: 11
-    day: 22
+    month: 12
+    day: 6
   }
   homepage: "https://github.com/webmproject/CrabbyAvif"
   identifier {
     type: "Git"
     value: "https://github.com/webmproject/CrabbyAvif.git"
-    version: "f7b017a21871bacf3de14c0ef366aaf16ef10cb4"
+    version: "a6987b0a607470dffd02e0d5ea69cae8af552a89"
     primary_source: true
   }
 }
