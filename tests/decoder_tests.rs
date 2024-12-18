@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use crabby_avif::decoder::track::RepetitionCount;
+use crabby_avif::decoder::CompressionFormat;
+use crabby_avif::decoder::ImageContentType;
 use crabby_avif::image::*;
 use crabby_avif::reformat::rgb;
 use crabby_avif::*;
@@ -61,6 +63,7 @@ fn animated_image() {
     let mut decoder = get_decoder("colors-animated-8bpc.avif");
     let res = decoder.parse();
     assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     let image = decoder.image().expect("image was none");
     assert!(!image.alpha_present);
     assert!(image.image_sequence_track_present);
@@ -84,6 +87,7 @@ fn animated_image_with_source_set_to_primary_item() {
     decoder.settings.source = decoder::Source::PrimaryItem;
     let res = decoder.parse();
     assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     let image = decoder.image().expect("image was none");
     assert!(!image.alpha_present);
     // This will be reported as true irrespective of the preferred source.
@@ -108,6 +112,7 @@ fn animated_image_with_alpha_and_metadata() {
     let mut decoder = get_decoder("colors-animated-8bpc-alpha-exif-xmp.avif");
     let res = decoder.parse();
     assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     let image = decoder.image().expect("image was none");
     assert!(image.alpha_present);
     assert!(image.image_sequence_track_present);
@@ -129,6 +134,7 @@ fn keyframes() {
     let mut decoder = get_decoder("colors-animated-12bpc-keyframes-0-2-3.avif");
     let res = decoder.parse();
     assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     let image = decoder.image().expect("image was none");
     assert!(image.image_sequence_track_present);
     assert_eq!(decoder.image_count(), 5);
@@ -161,6 +167,7 @@ fn color_grid_alpha_no_grid() {
     let mut decoder = get_decoder("color_grid_alpha_nogrid.avif");
     let res = decoder.parse();
     assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     let image = decoder.image().expect("image was none");
     assert!(image.alpha_present);
     assert!(!image.image_sequence_track_present);
@@ -190,6 +197,7 @@ fn progressive(filename: &str, layer_count: u32, width: u32, height: u32) {
     decoder.settings.allow_progressive = false;
     let res = decoder.parse();
     assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     let image = decoder.image().expect("image was none");
     assert!(matches!(
         image.progressive_state,
@@ -199,6 +207,7 @@ fn progressive(filename: &str, layer_count: u32, width: u32, height: u32) {
     decoder.settings.allow_progressive = true;
     let res = decoder.parse();
     assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     let image = decoder.image().expect("image was none");
     assert!(matches!(
         image.progressive_state,
@@ -229,6 +238,7 @@ fn decoder_parse_icc_exif_xmp() {
     decoder.settings.ignore_exif = true;
     let res = decoder.parse();
     assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     let image = decoder.image().expect("image was none");
 
     assert_eq!(image.icc.len(), 596);
@@ -244,6 +254,7 @@ fn decoder_parse_icc_exif_xmp() {
     decoder.settings.ignore_exif = false;
     let res = decoder.parse();
     assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     let image = decoder.image().expect("image was none");
 
     assert_eq!(image.exif.len(), 1126);
@@ -263,10 +274,10 @@ fn decoder_parse_icc_exif_xmp() {
 #[test]
 fn color_grid_gainmap_different_grid() {
     let mut decoder = get_decoder("color_grid_gainmap_different_grid.avif");
-    decoder.settings.enable_decoding_gainmap = true;
-    decoder.settings.enable_parsing_gainmap_metadata = true;
+    decoder.settings.image_content_to_decode = ImageContentType::All;
     let res = decoder.parse();
     assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     let image = decoder.image().expect("image was none");
     // Color+alpha: 4x3 grid of 128x200 tiles.
     assert_eq!(image.width, 128 * 4);
@@ -284,16 +295,17 @@ fn color_grid_gainmap_different_grid() {
     }
     let res = decoder.next_image();
     assert!(res.is_ok());
+    assert!(decoder.gainmap().image.row_bytes[0] > 0);
 }
 
 // From avifgainmaptest.cc
 #[test]
 fn color_grid_alpha_grid_gainmap_nogrid() {
     let mut decoder = get_decoder("color_grid_alpha_grid_gainmap_nogrid.avif");
-    decoder.settings.enable_decoding_gainmap = true;
-    decoder.settings.enable_parsing_gainmap_metadata = true;
+    decoder.settings.image_content_to_decode = ImageContentType::All;
     let res = decoder.parse();
     assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     let image = decoder.image().expect("image was none");
     // Color+alpha: 4x3 grid of 128x200 tiles.
     assert_eq!(image.width, 128 * 4);
@@ -311,16 +323,17 @@ fn color_grid_alpha_grid_gainmap_nogrid() {
     }
     let res = decoder.next_image();
     assert!(res.is_ok());
+    assert!(decoder.gainmap().image.row_bytes[0] > 0);
 }
 
 // From avifgainmaptest.cc
 #[test]
 fn color_nogrid_alpha_nogrid_gainmap_grid() {
     let mut decoder = get_decoder("color_nogrid_alpha_nogrid_gainmap_grid.avif");
-    decoder.settings.enable_decoding_gainmap = true;
-    decoder.settings.enable_parsing_gainmap_metadata = true;
+    decoder.settings.image_content_to_decode = ImageContentType::All;
     let res = decoder.parse();
     assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     let image = decoder.image().expect("image was none");
     // Color+alpha: single image of size 128x200.
     assert_eq!(image.width, 128);
@@ -338,22 +351,150 @@ fn color_nogrid_alpha_nogrid_gainmap_grid() {
     }
     let res = decoder.next_image();
     assert!(res.is_ok());
+    assert!(decoder.gainmap().image.row_bytes[0] > 0);
 }
 
 // From avifgainmaptest.cc
 #[test]
 fn gainmap_oriented() {
     let mut decoder = get_decoder("gainmap_oriented.avif");
-    decoder.settings.enable_decoding_gainmap = true;
-    decoder.settings.enable_parsing_gainmap_metadata = true;
+    decoder.settings.image_content_to_decode = ImageContentType::All;
     let res = decoder.parse();
     assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     let image = decoder.image().expect("image was none");
     assert_eq!(image.irot_angle, Some(1));
     assert_eq!(image.imir_axis, Some(0));
     assert!(decoder.gainmap_present());
     assert_eq!(decoder.gainmap().image.irot_angle, None);
     assert_eq!(decoder.gainmap().image.imir_axis, None);
+}
+
+// The two test files should produce the same results:
+// One has an unsupported 'version' field, the other an unsupported
+// 'minimum_version' field, but the behavior of these two files is the same.
+// From avifgainmaptest.cc
+#[test_case::test_case("unsupported_gainmap_version.avif")]
+#[test_case::test_case("unsupported_gainmap_minimum_version.avif")]
+fn decode_unsupported_version(filename: &str) {
+    // Parse with various settings.
+    let mut decoder = get_decoder(filename);
+    let res = decoder.parse();
+    assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
+    // Gain map marked as not present because the metadata is not supported.
+    assert!(!decoder.gainmap_present());
+    assert_eq!(decoder.gainmap().image.width, 0);
+    assert_eq!(decoder.gainmap().metadata.base_hdr_headroom.0, 0);
+    assert_eq!(decoder.gainmap().metadata.alternate_hdr_headroom.0, 0);
+
+    decoder = get_decoder(filename);
+    decoder.settings.image_content_to_decode = ImageContentType::All;
+    let res = decoder.parse();
+    assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
+    // Gainmap not found: its metadata is not supported.
+    assert!(!decoder.gainmap_present());
+    assert_eq!(decoder.gainmap().image.width, 0);
+    assert_eq!(decoder.gainmap().metadata.base_hdr_headroom.0, 0);
+    assert_eq!(decoder.gainmap().metadata.alternate_hdr_headroom.0, 0);
+}
+
+// From avifgainmaptest.cc
+#[test]
+fn decode_unsupported_writer_version_with_extra_bytes() {
+    let mut decoder = get_decoder("unsupported_gainmap_writer_version_with_extra_bytes.avif");
+    let res = decoder.parse();
+    assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
+    // Decodes successfully: there are extra bytes at the end of the gain map
+    // metadata but that's expected as the writer_version field is higher
+    // that supported.
+    assert!(decoder.gainmap_present());
+    assert_eq!(decoder.gainmap().metadata.base_hdr_headroom.0, 6);
+    assert_eq!(decoder.gainmap().metadata.base_hdr_headroom.1, 2);
+}
+
+// From avifgainmaptest.cc
+#[test]
+fn decode_supported_writer_version_with_extra_bytes() {
+    let mut decoder = get_decoder("supported_gainmap_writer_version_with_extra_bytes.avif");
+    let res = decoder.parse();
+    // Fails to decode: there are extra bytes at the end of the gain map metadata
+    // that shouldn't be there.
+    assert!(matches!(res, Err(AvifError::InvalidToneMappedImage(_))));
+}
+
+// From avifgainmaptest.cc
+#[test]
+fn decode_ignore_gain_map_but_read_metadata() {
+    let mut decoder = get_decoder("seine_sdr_gainmap_srgb.avif");
+
+    let res = decoder.parse();
+    assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
+    decoder.image().expect("image was none");
+    // Gain map not decoded.
+    assert!(decoder.gainmap_present());
+    // ... but not decoded because enableDecodingGainMap is false by default.
+    assert_eq!(decoder.gainmap().image.width, 0);
+    assert_eq!(decoder.gainmap().image.row_bytes[0], 0);
+    // Check that the gain map metadata WAS populated.
+    assert_eq!(decoder.gainmap().metadata.alternate_hdr_headroom.0, 13);
+    assert_eq!(decoder.gainmap().metadata.alternate_hdr_headroom.1, 10);
+}
+
+// From avifgainmaptest.cc
+#[test]
+fn decode_ignore_color_and_alpha() {
+    let mut decoder = get_decoder("seine_sdr_gainmap_srgb.avif");
+    decoder.settings.image_content_to_decode = ImageContentType::GainMap;
+
+    let res = decoder.parse();
+    assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
+
+    let image = decoder.image().expect("image was none");
+    // Main image metadata is available.
+    assert_eq!(image.width, 400);
+    // The gain map metadata is available.
+    assert!(decoder.gainmap_present());
+    assert_eq!(decoder.gainmap().image.width, 400);
+    assert_eq!(decoder.gainmap().metadata.alternate_hdr_headroom.0, 13);
+
+    if !HAS_DECODER {
+        return;
+    }
+    let res = decoder.next_image();
+    let image = decoder.image().expect("image was none");
+    assert!(res.is_ok());
+    // Main image pixels are not available.
+    assert_eq!(image.row_bytes[0], 0);
+    // Gain map pixels are available.
+    assert!(decoder.gainmap().image.row_bytes[0] > 0);
+}
+
+// From avifgainmaptest.cc
+#[test_case::test_case("paris_icc_exif_xmp.avif")]
+#[test_case::test_case("sofa_grid1x5_420.avif")]
+#[test_case::test_case("color_grid_alpha_nogrid.avif")]
+#[test_case::test_case("seine_sdr_gainmap_srgb.avif")]
+fn decode_ignore_all(filename: &str) {
+    let mut decoder = get_decoder(filename);
+    // Ignore both the main image and the gain map.
+    decoder.settings.image_content_to_decode = ImageContentType::None;
+    // But do read the gain map metadata
+
+    let res = decoder.parse();
+    assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
+    let image = decoder.image().expect("image was none");
+    // Main image metadata is available.
+    assert!(image.width > 0);
+    // But trying to access the next image should give an error because both
+    // ignoreColorAndAlpha and enableDecodingGainMap are set.
+    let res = decoder.next_image();
+    assert!(res.is_err());
 }
 
 // From avifcllitest.cc
@@ -372,6 +513,7 @@ fn clli(filename: &str, max_cll: u16, max_pall: u16) {
     let mut decoder = get_decoder(&filename_with_prefix);
     let res = decoder.parse();
     assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     let image = decoder.image().expect("image was none");
     if max_cll == 0 && max_pall == 0 {
         assert!(image.clli.is_none());
@@ -388,10 +530,13 @@ fn raw_io() {
     let data =
         std::fs::read(get_test_file("colors-animated-8bpc.avif")).expect("Unable to read file");
     let mut decoder = decoder::Decoder::default();
-    let _ = decoder
-        .set_io_raw(data.as_ptr(), data.len())
-        .expect("Failed to set IO");
+    let _ = unsafe {
+        decoder
+            .set_io_raw(data.as_ptr(), data.len())
+            .expect("Failed to set IO")
+    };
     assert!(decoder.parse().is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     assert_eq!(decoder.image_count(), 5);
     if !HAS_DECODER {
         return;
@@ -446,6 +591,7 @@ fn custom_io() {
     });
     decoder.set_io(io);
     assert!(decoder.parse().is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     assert_eq!(decoder.image_count(), 5);
     if !HAS_DECODER {
         return;
@@ -607,6 +753,7 @@ fn nth_image() {
     let mut decoder = get_decoder("colors-animated-8bpc.avif");
     let res = decoder.parse();
     assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     assert_eq!(decoder.image_count(), 5);
     if !HAS_DECODER {
         return;
@@ -625,6 +772,7 @@ fn color_and_alpha_dimensions_do_not_match() {
     // Parsing should succeed.
     let res = decoder.parse();
     assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     let image = decoder.image().expect("image was none");
     assert_eq!(image.width, 10);
     assert_eq!(image.height, 10);
@@ -641,6 +789,7 @@ fn rgb_conversion_alpha_premultiply() -> AvifResult<()> {
     let mut decoder = get_decoder("alpha.avif");
     let res = decoder.parse();
     assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     if !HAS_DECODER {
         return Ok(());
     }
@@ -658,6 +807,7 @@ fn rgb_conversion_alpha_premultiply() -> AvifResult<()> {
 fn white_1x1() -> AvifResult<()> {
     let mut decoder = get_decoder("white_1x1.avif");
     assert_eq!(decoder.parse(), Ok(()));
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     if !HAS_DECODER {
         return Ok(());
     }
@@ -689,6 +839,7 @@ fn white_1x1_mdat_size0() -> AvifResult<()> {
     let mut decoder = decoder::Decoder::default();
     decoder.set_io_vec(file_bytes);
     assert_eq!(decoder.parse(), Ok(()));
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     Ok(())
 }
 
@@ -708,6 +859,7 @@ fn white_1x1_meta_size0() -> AvifResult<()> {
     // item extents to be read from the MediaDataBox if the construction_method is 0.
     // Maybe another section or specification enforces that.
     assert_eq!(decoder.parse(), Ok(()));
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     if !HAS_DECODER {
         return Ok(());
     }
@@ -768,4 +920,35 @@ fn dimg_ordering() {
     let row1 = image1.row(Plane::Y, 0).expect("row1 was none");
     let row2 = image2.row(Plane::Y, 0).expect("row2 was none");
     assert_ne!(row1, row2);
+}
+
+#[test]
+fn heic_peek() {
+    let file_data = std::fs::read(get_test_file("blue.heic")).expect("could not read file");
+    assert_eq!(
+        decoder::Decoder::peek_compatible_file_type(&file_data),
+        cfg!(feature = "heic")
+    );
+}
+
+#[test]
+fn heic_parsing() {
+    let mut decoder = get_decoder("blue.heic");
+    let res = decoder.parse();
+    if cfg!(feature = "heic") {
+        assert!(res.is_ok());
+        let image = decoder.image().expect("image was none");
+        assert_eq!(image.width, 320);
+        assert_eq!(image.height, 240);
+        assert_eq!(decoder.compression_format(), CompressionFormat::Heic);
+        if cfg!(feature = "android_mediacodec") {
+            // Decoding is available only via android_mediacodec.
+            assert!(!matches!(
+                decoder.next_image(),
+                Err(AvifError::NoCodecAvailable)
+            ));
+        }
+    } else {
+        assert!(res.is_err());
+    }
 }
