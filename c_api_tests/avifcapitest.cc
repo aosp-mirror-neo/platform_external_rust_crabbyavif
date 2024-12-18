@@ -30,7 +30,15 @@ TEST(AvifDecodeTest, OneShotDecodeFile) {
   EXPECT_EQ(image.height, 770);
   EXPECT_EQ(image.depth, 8);
 
-  // TODO: Add test using same decoder with another read.
+  // Call avifDecoderReadFile with a different file but with the same decoder
+  // instance.
+  file_name = "white_1x1.avif";
+  ASSERT_EQ(avifDecoderReadFile(decoder.get(), &image,
+                                get_file_name(file_name).c_str()),
+            AVIF_RESULT_OK);
+  EXPECT_EQ(image.width, 1);
+  EXPECT_EQ(image.height, 1);
+  EXPECT_EQ(image.depth, 8);
 }
 
 TEST(AvifDecodeTest, OneShotDecodeMemory) {
@@ -98,6 +106,7 @@ TEST(AvifDecodeTest, NthImage) {
                                  (std::string(data_path) + file_name).c_str()),
             AVIF_RESULT_OK);
   ASSERT_EQ(avifDecoderParse(decoder.get()), AVIF_RESULT_OK);
+  EXPECT_EQ(decoder->compressionFormat, COMPRESSION_FORMAT_AVIF);
   EXPECT_EQ(decoder->imageCount, 5);
   EXPECT_EQ(avifDecoderNthImage(decoder.get(), 3), AVIF_RESULT_OK);
   EXPECT_EQ(avifDecoderNextImage(decoder.get()), AVIF_RESULT_OK);

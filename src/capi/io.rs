@@ -42,8 +42,8 @@ impl Default for avifROData {
 #[repr(C)]
 #[derive(Clone, Debug)]
 pub struct avifRWData {
-    data: *mut u8,
-    size: usize,
+    pub data: *mut u8,
+    pub size: usize,
 }
 
 impl Default for avifRWData {
@@ -115,6 +115,9 @@ pub unsafe extern "C" fn crabby_avifRWDataSet(
 #[no_mangle]
 pub unsafe extern "C" fn crabby_avifRWDataFree(raw: *mut avifRWData) {
     unsafe {
+        if (*raw).data.is_null() {
+            return;
+        }
         let _ = Box::from_raw(std::slice::from_raw_parts_mut((*raw).data, (*raw).size));
     }
 }
@@ -177,7 +180,7 @@ impl crate::decoder::IO for avifIOWrapper {
         }
         if self.data.size == 0 {
             Ok(&[])
-        } else if self.data.data == std::ptr::null() {
+        } else if self.data.data.is_null() {
             Err(AvifError::UnknownError(
                 "data pointer was null but size was not zero".into(),
             ))
@@ -247,7 +250,7 @@ pub unsafe extern "C" fn crabby_avifIOCreateMemoryReader(
     size: usize,
 ) -> *mut avifIO {
     let cio = Box::new(avifCIOWrapper {
-        io: Box::new(DecoderRawIO::create(data, size)),
+        io: Box::new(unsafe { DecoderRawIO::create(data, size) }),
         buf: Vec::new(),
     });
     let io = Box::new(avifIO {
