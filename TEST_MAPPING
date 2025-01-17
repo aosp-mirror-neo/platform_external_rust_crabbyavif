@@ -1,7 +1,34 @@
 {
   "presubmit": [
     {
-      "name": "CtsGraphicsTestCases"
+      "name": "CtsGraphicsTestCases",
+      "options": [
+        {
+          "include-filter": "android.graphics.cts.AImageDecoderTest"
+        },
+        {
+          "include-filter": "android.graphics.cts.BitmapFactoryTest"
+        },
+        {
+          "include-filter": "android.graphics.cts.BitmapRegionDecoderTest"
+        },
+        {
+          "include-filter": "android.graphics.cts.ImageDecoderTest"
+        }
+      ]
+    }
+  ],
+  "presubmit-large": [
+    {
+      "name": "CtsMediaMiscTestCases",
+      "options": [
+        {
+          "include-filter": "android.media.misc.cts.MediaMetadataRetrieverTest"
+        },
+        {
+          "include-filter": "android.media.misc.cts.ThumbnailUtilsTest"
+        }
+      ]
     }
   ]
 }
