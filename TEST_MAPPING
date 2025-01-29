@@ -23,6 +23,12 @@
       "name": "CtsMediaMiscTestCases",
       "options": [
         {
+          "include-filter": "android.media.misc.cts.ExifInterfaceTest"
+        },
+        {
+          "include-filter": "android.media.misc.cts.HeifWriterTest"
+        },
+        {
           "include-filter": "android.media.misc.cts.MediaMetadataRetrieverTest"
         },
         {
