@@ -892,6 +892,19 @@ impl Decoder {
                     })
                     .map(|it| *it.0);
 
+                // TODO: b/393135956 - There are some unsupported HEIC primary item types (like
+                // overlay derivation). In that case, try and return the first available HEIC item.
+                // Remove this workaround once overlay derivation is supported.
+                let color_item_id = if cfg!(feature = "heic") && color_item_id.is_none() {
+                    // Look for the first valid HEIC item.
+                    self.items
+                        .iter()
+                        .find(|x| !x.1.should_skip() && x.1.id != 0 && x.1.is_image_item())
+                        .map(|it| *it.0)
+                } else {
+                    color_item_id
+                };
+
                 item_ids[Category::Color.usize()] = color_item_id.ok_or(AvifError::NoContent)?;
                 self.read_and_parse_item(item_ids[Category::Color.usize()], Category::Color)?;
                 self.populate_grid_item_ids(item_ids[Category::Color.usize()], Category::Color)?;
@@ -1368,7 +1381,23 @@ impl Decoder {
             &self.items.get(&sample.item_id).unwrap().data_buffer
         };
         let data = sample.data(io, item_data_buffer)?;
-        codec.get_next_image(data, sample.spatial_id, &mut tile.image, category)?;
+        let next_image_result =
+            codec.get_next_image(data, sample.spatial_id, &mut tile.image, category);
+        if next_image_result.is_err() {
+            if cfg!(feature = "android_mediacodec")
+                && cfg!(feature = "heic")
+                && tile.codec_config.is_heic()
+                && category == Category::Alpha
+            {
+                // When decoding HEIC on Android, if the alpha channel decoding fails, simply
+                // ignore it and return the rest of the image.
+                checked_incr!(self.tile_info[category.usize()].decoded_tile_count, 1);
+                return Ok(());
+            } else {
+                return next_image_result;
+            }
+        }
+
         checked_incr!(self.tile_info[category.usize()].decoded_tile_count, 1);
 
         if category == Category::Alpha && tile.image.yuv_range == YuvRange::Limited {
