@@ -38,7 +38,7 @@ pub struct Item {
     pub has_unsupported_essential_property: bool,
     pub progressive: bool,
     pub idat: Vec<u8>,
-    pub grid_item_ids: Vec<u32>,
+    pub derived_item_ids: Vec<u32>,
     pub data_buffer: Option<Vec<u8>>,
     pub is_made_up: bool, // Placeholder grid alpha item if true.
 }
@@ -91,57 +91,123 @@ impl Item {
         Ok(IStream::create(io_data))
     }
 
+    fn validate_derived_image_dimensions(
+        width: u32,
+        height: u32,
+        size_limit: u32,
+        dimension_limit: u32,
+    ) -> AvifResult<()> {
+        if width == 0 || height == 0 || !check_limits(width, height, size_limit, dimension_limit) {
+            return Err(AvifError::InvalidImageGrid(
+                "invalid derived image dimensions".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn read_and_parse(
         &mut self,
         io: &mut GenericIO,
         grid: &mut Grid,
+        overlay: &mut Overlay,
         size_limit: u32,
         dimension_limit: u32,
     ) -> AvifResult<()> {
-        if self.item_type != "grid" {
-            return Ok(());
+        match self.item_type.as_str() {
+            "grid" => {
+                let mut stream = self.stream(io)?;
+                // unsigned int(8) version = 0;
+                let version = stream.read_u8()?;
+                if version != 0 {
+                    return Err(AvifError::InvalidImageGrid(
+                        "unsupported version for grid".into(),
+                    ));
+                }
+                // unsigned int(8) flags;
+                let flags = stream.read_u8()?;
+                // unsigned int(8) rows_minus_one;
+                grid.rows = stream.read_u8()? as u32 + 1;
+                // unsigned int(8) columns_minus_one;
+                grid.columns = stream.read_u8()? as u32 + 1;
+                if (flags & 1) == 1 {
+                    // unsigned int(32) output_width;
+                    grid.width = stream.read_u32()?;
+                    // unsigned int(32) output_height;
+                    grid.height = stream.read_u32()?;
+                } else {
+                    // unsigned int(16) output_width;
+                    grid.width = stream.read_u16()? as u32;
+                    // unsigned int(16) output_height;
+                    grid.height = stream.read_u16()? as u32;
+                }
+                Self::validate_derived_image_dimensions(
+                    grid.width,
+                    grid.height,
+                    size_limit,
+                    dimension_limit,
+                )?;
+                if stream.has_bytes_left()? {
+                    return Err(AvifError::InvalidImageGrid(
+                        "found unknown extra bytes in the grid box".into(),
+                    ));
+                }
+                Ok(())
+            }
+            "iovl" => {
+                let reference_count = self.derived_item_ids.len();
+                let mut stream = self.stream(io)?;
+                // unsigned int(8) version = 0;
+                let version = stream.read_u8()?;
+                if version != 0 {
+                    return Err(AvifError::InvalidImageGrid(format!(
+                        "unsupported version {version} for iovl"
+                    )));
+                }
+                // unsigned int(8) flags;
+                let flags = stream.read_u8()?;
+                for j in 0..4 {
+                    // unsigned int(16) canvas_fill_value;
+                    overlay.canvas_fill_value[j] = stream.read_u16()?;
+                }
+                if (flags & 1) == 1 {
+                    // unsigned int(32) output_width;
+                    overlay.width = stream.read_u32()?;
+                    // unsigned int(32) output_height;
+                    overlay.height = stream.read_u32()?;
+                } else {
+                    // unsigned int(16) output_width;
+                    overlay.width = stream.read_u16()? as u32;
+                    // unsigned int(16) output_height;
+                    overlay.height = stream.read_u16()? as u32;
+                }
+                Self::validate_derived_image_dimensions(
+                    overlay.width,
+                    overlay.height,
+                    size_limit,
+                    dimension_limit,
+                )?;
+                for _ in 0..reference_count {
+                    if (flags & 1) == 1 {
+                        // unsigned int(32) horizontal_offset;
+                        overlay.horizontal_offsets.push(stream.read_i32()?);
+                        // unsigned int(32) vertical_offset;
+                        overlay.vertical_offsets.push(stream.read_i32()?);
+                    } else {
+                        // unsigned int(16) horizontal_offset;
+                        overlay.horizontal_offsets.push(stream.read_i16()? as i32);
+                        // unsigned int(16) vertical_offset;
+                        overlay.vertical_offsets.push(stream.read_i16()? as i32);
+                    }
+                }
+                if stream.has_bytes_left()? {
+                    return Err(AvifError::InvalidImageGrid(
+                        "found unknown extra bytes in the iovl box".into(),
+                    ));
+                }
+                Ok(())
+            }
+            _ => Ok(()),
         }
-        let mut stream = self.stream(io)?;
-        // unsigned int(8) version = 0;
-        let version = stream.read_u8()?;
-        if version != 0 {
-            return Err(AvifError::InvalidImageGrid(
-                "unsupported version for grid".into(),
-            ));
-        }
-        // unsigned int(8) flags;
-        let flags = stream.read_u8()?;
-        // unsigned int(8) rows_minus_one;
-        grid.rows = stream.read_u8()? as u32 + 1;
-        // unsigned int(8) columns_minus_one;
-        grid.columns = stream.read_u8()? as u32 + 1;
-        if (flags & 1) == 1 {
-            // unsigned int(32) output_width;
-            grid.width = stream.read_u32()?;
-            // unsigned int(32) output_height;
-            grid.height = stream.read_u32()?;
-        } else {
-            // unsigned int(16) output_width;
-            grid.width = stream.read_u16()? as u32;
-            // unsigned int(16) output_height;
-            grid.height = stream.read_u16()? as u32;
-        }
-        if grid.width == 0 || grid.height == 0 {
-            return Err(AvifError::InvalidImageGrid(
-                "invalid dimensions in grid box".into(),
-            ));
-        }
-        if !check_limits(grid.width, grid.height, size_limit, dimension_limit) {
-            return Err(AvifError::InvalidImageGrid(
-                "grid dimensions too large".into(),
-            ));
-        }
-        if stream.has_bytes_left()? {
-            return Err(AvifError::InvalidImageGrid(
-                "found unknown extra bytes in the grid box".into(),
-            ));
-        }
-        Ok(())
     }
 
     pub(crate) fn operating_point(&self) -> u8 {
@@ -203,15 +269,18 @@ impl Item {
         let codec_config = self
             .codec_config()
             .ok_or(AvifError::BmffParseFailed("missing av1C property".into()))?;
-        if self.item_type == "grid" {
-            for grid_item_id in &self.grid_item_ids {
-                let grid_item = items.get(grid_item_id).unwrap();
-                let grid_codec_config = grid_item.codec_config().ok_or(
-                    AvifError::BmffParseFailed("missing codec config property".into()),
-                )?;
-                if codec_config != grid_codec_config {
+        if self.item_type == "grid" || self.item_type == "iovl" {
+            for derived_item_id in &self.derived_item_ids {
+                let derived_item = items.get(derived_item_id).unwrap();
+                let derived_codec_config =
+                    derived_item
+                        .codec_config()
+                        .ok_or(AvifError::BmffParseFailed(
+                            "missing codec config property".into(),
+                        ))?;
+                if codec_config != derived_codec_config {
                     return Err(AvifError::BmffParseFailed(
-                        "codec config of grid items do not match".into(),
+                        "codec config of derived items do not match".into(),
                     ));
                 }
             }
@@ -271,7 +340,7 @@ impl Item {
     }
 
     pub(crate) fn is_image_item(&self) -> bool {
-        self.is_image_codec_item() || self.item_type == "grid"
+        self.is_image_codec_item() || self.item_type == "grid" || self.item_type == "iovl"
     }
 
     pub(crate) fn should_skip(&self) -> bool {
@@ -422,7 +491,12 @@ pub(crate) fn construct_items(meta: &MetaBox) -> AvifResult<Items> {
             let property_index: usize = *property_index_ref as usize;
             let essential = *essential_ref;
             if property_index == 0 {
-                // Not associated with any item.
+                if essential {
+                    return Err(AvifError::BmffParseFailed(format!(
+                        "item id {} contains an illegal essential property index 0",
+                        { item.id }
+                    )));
+                }
                 continue;
             }
             // property_index is 1-based.
@@ -440,7 +514,14 @@ pub(crate) fn construct_items(meta: &MetaBox) -> AvifResult<Items> {
                     ));
                 }
                 (
-                    ItemProperty::OperatingPointSelector(_) | ItemProperty::LayerSelector(_),
+                    ItemProperty::OperatingPointSelector(_)
+                    | ItemProperty::LayerSelector(_)
+                    // MIAF 2019/Amd. 2:2021: Section 7.3.9:
+                    //   All transformative properties associated with coded and derived images
+                    //   shall be marked as essential.
+                    | ItemProperty::CleanAperture(_)
+                    | ItemProperty::ImageRotation(_)
+                    | ItemProperty::ImageMirror(_),
                     false,
                 ) => {
                     return Err(AvifError::BmffParseFailed(
