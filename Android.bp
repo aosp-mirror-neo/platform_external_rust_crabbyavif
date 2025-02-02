@@ -99,6 +99,8 @@ rust_ffi_static {
         "heic",
     ],
     rustlibs: [
+        "liblogger",
+        "liblog_rust",
         "liblibyuv_sys",
         "libndk_sys",
         "librustutils",

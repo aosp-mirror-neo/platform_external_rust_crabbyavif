@@ -51,7 +51,7 @@ pub trait IO {
 }
 
 impl dyn IO {
-    pub fn read_exact(&mut self, offset: u64, read_size: usize) -> AvifResult<&[u8]> {
+    pub(crate) fn read_exact(&mut self, offset: u64, read_size: usize) -> AvifResult<&[u8]> {
         let result = self.read(offset, read_size)?;
         if result.len() < read_size {
             Err(AvifError::TruncatedData)
@@ -135,7 +135,7 @@ pub enum ImageContentType {
 }
 
 impl ImageContentType {
-    pub fn categories(&self) -> Vec<Category> {
+    pub(crate) fn categories(&self) -> Vec<Category> {
         match self {
             Self::None => vec![],
             Self::ColorAndAlpha => vec![Category::Color, Category::Alpha],
@@ -144,7 +144,7 @@ impl ImageContentType {
         }
     }
 
-    pub fn gainmap(&self) -> bool {
+    pub(crate) fn gainmap(&self) -> bool {
         matches!(self, Self::GainMap | Self::All)
     }
 }
@@ -228,7 +228,7 @@ pub enum Strictness {
 }
 
 impl Strictness {
-    pub fn pixi_required(&self) -> bool {
+    pub(crate) fn pixi_required(&self) -> bool {
         match self {
             Strictness::All => true,
             Strictness::SpecificInclude(flags) => flags
@@ -241,7 +241,7 @@ impl Strictness {
         }
     }
 
-    pub fn alpha_ispe_required(&self) -> bool {
+    pub(crate) fn alpha_ispe_required(&self) -> bool {
         match self {
             Strictness::All => true,
             Strictness::SpecificInclude(flags) => flags
@@ -329,7 +329,7 @@ impl Category {
     const ALL: [Category; Category::COUNT] = [Self::Color, Self::Alpha, Self::Gainmap];
     const ALL_USIZE: [usize; Category::COUNT] = [0, 1, 2];
 
-    pub fn usize(self) -> usize {
+    pub(crate) fn usize(self) -> usize {
         match self {
             Category::Color => 0,
             Category::Alpha => 1,
@@ -337,21 +337,12 @@ impl Category {
         }
     }
 
-    pub fn planes(&self) -> &[Plane] {
+    pub(crate) fn planes(&self) -> &[Plane] {
         match self {
             Category::Alpha => &A_PLANE,
             _ => &YUV_PLANES,
         }
     }
-}
-
-macro_rules! find_property {
-    ($properties:expr, $property_name:ident) => {
-        $properties.iter().find_map(|p| match p {
-            ItemProperty::$property_name(value) => Some(value.clone()),
-            _ => None,
-        })
-    };
 }
 
 impl Decoder {
@@ -901,6 +892,19 @@ impl Decoder {
                     })
                     .map(|it| *it.0);
 
+                // TODO: b/393135956 - There are some unsupported HEIC primary item types (like
+                // overlay derivation). In that case, try and return the first available HEIC item.
+                // Remove this workaround once overlay derivation is supported.
+                let color_item_id = if cfg!(feature = "heic") && color_item_id.is_none() {
+                    // Look for the first valid HEIC item.
+                    self.items
+                        .iter()
+                        .find(|x| !x.1.should_skip() && x.1.id != 0 && x.1.is_image_item())
+                        .map(|it| *it.0)
+                } else {
+                    color_item_id
+                };
+
                 item_ids[Category::Color.usize()] = color_item_id.ok_or(AvifError::NoContent)?;
                 self.read_and_parse_item(item_ids[Category::Color.usize()], Category::Color)?;
                 self.populate_grid_item_ids(item_ids[Category::Color.usize()], Category::Color)?;
@@ -930,6 +934,7 @@ impl Decoder {
                     if let Some((tonemap_id, gainmap_id)) =
                         self.find_gainmap_item(item_ids[Category::Color.usize()])?
                     {
+                        self.validate_gainmap_item(gainmap_id, tonemap_id)?;
                         let tonemap_item = self
                             .items
                             .get_mut(&tonemap_id)
@@ -939,7 +944,6 @@ impl Decoder {
                             self.gainmap.metadata = metadata;
                             self.read_and_parse_item(gainmap_id, Category::Gainmap)?;
                             self.populate_grid_item_ids(gainmap_id, Category::Gainmap)?;
-                            self.validate_gainmap_item(gainmap_id, tonemap_id)?;
                             self.gainmap_present = true;
                             if self.settings.image_content_to_decode.gainmap() {
                                 item_ids[Category::Gainmap.usize()] = gainmap_id;
@@ -1377,7 +1381,23 @@ impl Decoder {
             &self.items.get(&sample.item_id).unwrap().data_buffer
         };
         let data = sample.data(io, item_data_buffer)?;
-        codec.get_next_image(data, sample.spatial_id, &mut tile.image, category)?;
+        let next_image_result =
+            codec.get_next_image(data, sample.spatial_id, &mut tile.image, category);
+        if next_image_result.is_err() {
+            if cfg!(feature = "android_mediacodec")
+                && cfg!(feature = "heic")
+                && tile.codec_config.is_heic()
+                && category == Category::Alpha
+            {
+                // When decoding HEIC on Android, if the alpha channel decoding fails, simply
+                // ignore it and return the rest of the image.
+                checked_incr!(self.tile_info[category.usize()].decoded_tile_count, 1);
+                return Ok(());
+            } else {
+                return next_image_result;
+            }
+        }
+
         checked_incr!(self.tile_info[category.usize()].decoded_tile_count, 1);
 
         if category == Category::Alpha && tile.image.yuv_range == YuvRange::Limited {
@@ -1393,13 +1413,7 @@ impl Decoder {
                     Category::Color => {
                         self.image.width = grid.width;
                         self.image.height = grid.height;
-                        self.image.yuv_format = tile.image.yuv_format;
-                        self.image.depth = tile.image.depth;
-                        if cfg!(feature = "heic") && tile.codec_config.is_heic() {
-                            // For AVIF, this is harvested from the sequence header and does not
-                            // have to be updated here.
-                            self.image.yuv_range = tile.image.yuv_range;
-                        }
+                        self.image.copy_properties_from(tile);
                         self.image.allocate_planes(category)?;
                     }
                     Category::Alpha => {
@@ -1410,13 +1424,7 @@ impl Decoder {
                     Category::Gainmap => {
                         self.gainmap.image.width = grid.width;
                         self.gainmap.image.height = grid.height;
-                        self.gainmap.image.yuv_format = tile.image.yuv_format;
-                        self.gainmap.image.depth = tile.image.depth;
-                        if cfg!(feature = "heic") && tile.codec_config.is_heic() {
-                            // For AVIF, this is harvested from the sequence header and does not
-                            // have to be updated here.
-                            self.gainmap.image.yuv_range = tile.image.yuv_range;
-                        }
+                        self.gainmap.image.copy_properties_from(tile);
                         self.gainmap.image.allocate_planes(category)?;
                     }
                 }
@@ -1460,34 +1468,24 @@ impl Decoder {
                 Category::Color => {
                     self.image.width = tile.image.width;
                     self.image.height = tile.image.height;
-                    self.image.depth = tile.image.depth;
-                    self.image.yuv_format = tile.image.yuv_format;
-                    if cfg!(feature = "heic") && tile.codec_config.is_heic() {
-                        // For AVIF, this is harvested from the sequence header and does not
-                        // have to be updated here.
-                        self.image.yuv_range = tile.image.yuv_range;
-                    }
-                    self.image.steal_or_copy_from(&tile.image, category)?;
+                    self.image.copy_properties_from(tile);
+                    self.image
+                        .steal_or_copy_planes_from(&tile.image, category)?;
                 }
                 Category::Alpha => {
                     if !self.image.has_same_properties(&tile.image) {
                         return Err(AvifError::DecodeAlphaFailed);
                     }
-                    self.image.steal_or_copy_from(&tile.image, category)?;
+                    self.image
+                        .steal_or_copy_planes_from(&tile.image, category)?;
                 }
                 Category::Gainmap => {
                     self.gainmap.image.width = tile.image.width;
                     self.gainmap.image.height = tile.image.height;
-                    self.gainmap.image.depth = tile.image.depth;
-                    self.gainmap.image.yuv_format = tile.image.yuv_format;
-                    if cfg!(feature = "heic") && tile.codec_config.is_heic() {
-                        // For AVIF, this is harvested from the sequence header and does not
-                        // have to be updated here.
-                        self.gainmap.image.yuv_range = tile.image.yuv_range;
-                    }
+                    self.gainmap.image.copy_properties_from(tile);
                     self.gainmap
                         .image
-                        .steal_or_copy_from(&tile.image, category)?;
+                        .steal_or_copy_planes_from(&tile.image, category)?;
                 }
             }
         }
