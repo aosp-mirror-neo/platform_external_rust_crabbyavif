@@ -417,13 +417,13 @@ impl Decoder {
         }) {
             return Ok(Some(*item.0));
         }
-        if color_item.item_type != "grid" || color_item.grid_item_ids.is_empty() {
+        if color_item.item_type != "grid" || color_item.derived_item_ids.is_empty() {
             return Ok(None);
         }
         // If color item is a grid, check if there is an alpha channel which is represented as an
         // auxl item to each color tile item.
-        let mut alpha_item_indices: Vec<u32> = create_vec_exact(color_item.grid_item_ids.len())?;
-        for color_grid_item_id in &color_item.grid_item_ids {
+        let mut alpha_item_indices: Vec<u32> = create_vec_exact(color_item.derived_item_ids.len())?;
+        for color_grid_item_id in &color_item.derived_item_ids {
             match self
                 .items
                 .iter()
@@ -459,7 +459,7 @@ impl Decoder {
             item_type: String::from("grid"),
             width: color_item.width,
             height: color_item.height,
-            grid_item_ids: alpha_item_indices,
+            derived_item_ids: alpha_item_indices,
             properties,
             is_made_up: true,
             ..Item::default()
@@ -595,7 +595,7 @@ impl Decoder {
             .items
             .get(&item_id)
             .ok_or(AvifError::MissingImageItem)?;
-        if item.grid_item_ids.is_empty() {
+        if item.derived_item_ids.is_empty() {
             if item.size == 0 {
                 return Err(AvifError::MissingImageItem);
             }
@@ -608,30 +608,32 @@ impl Decoder {
             tile.input.category = category;
             tiles.push(tile);
         } else {
-            if !self.tile_info[category.usize()].is_grid() {
+            if !self.tile_info[category.usize()].is_grid()
+                && !self.tile_info[category.usize()].is_overlay()
+            {
                 return Err(AvifError::InvalidImageGrid(
-                    "dimg items were found but image is not grid.".into(),
+                    "dimg items were found but image is not grid or overlay.".into(),
                 ));
             }
             let mut progressive = true;
-            for grid_item_id in item.grid_item_ids.clone() {
-                let grid_item = self
+            for derived_item_id in item.derived_item_ids.clone() {
+                let derived_item = self
                     .items
-                    .get_mut(&grid_item_id)
-                    .ok_or(AvifError::InvalidImageGrid("missing grid item".into()))?;
+                    .get_mut(&derived_item_id)
+                    .ok_or(AvifError::InvalidImageGrid("missing derived item".into()))?;
                 let mut tile = Tile::create_from_item(
-                    grid_item,
+                    derived_item,
                     self.settings.allow_progressive,
                     self.settings.image_count_limit,
                     self.io.unwrap_ref().size_hint(),
                 )?;
                 tile.input.category = category;
                 tiles.push(tile);
-                progressive = progressive && grid_item.progressive;
+                progressive = progressive && derived_item.progressive;
             }
 
             if category == Category::Color && progressive {
-                // Propagate the progressive status to the top-level grid item.
+                // Propagate the progressive status to the top-level item.
                 self.items.get_mut(&item_id).unwrap().progressive = true;
             }
         }
@@ -673,6 +675,58 @@ impl Decoder {
             }
             search_size += 64;
         }
+        Ok(())
+    }
+
+    fn populate_overlay_item_ids(&mut self, item_id: u32) -> AvifResult<()> {
+        if self.items.get(&item_id).unwrap().item_type != "iovl" {
+            return Ok(());
+        }
+        let mut overlay_item_ids: Vec<u32> = vec![];
+        let mut first_codec_config: Option<CodecConfiguration> = None;
+        // Collect all the dimg items.
+        for dimg_item_id in self.items.keys() {
+            if *dimg_item_id == item_id {
+                continue;
+            }
+            let dimg_item = self
+                .items
+                .get(dimg_item_id)
+                .ok_or(AvifError::InvalidImageGrid("".into()))?;
+            if dimg_item.dimg_for_id != item_id {
+                continue;
+            }
+            if !dimg_item.is_image_codec_item() || dimg_item.has_unsupported_essential_property {
+                return Err(AvifError::InvalidImageGrid(
+                    "invalid input item in dimg grid".into(),
+                ));
+            }
+            if first_codec_config.is_none() {
+                // Adopt the configuration property of the first tile.
+                // validate_properties() makes sure they are all equal.
+                first_codec_config = Some(
+                    dimg_item
+                        .codec_config()
+                        .ok_or(AvifError::BmffParseFailed(
+                            "missing codec config property".into(),
+                        ))?
+                        .clone(),
+                );
+            }
+            overlay_item_ids.push(*dimg_item_id);
+        }
+        // ISO/IEC 23008-12: The input images are listed in the order they are layered, i.e. the
+        // bottom-most input image first and the top-most input image last, in the
+        // SingleItemTypeReferenceBox of type 'dimg' for this derived image item within the
+        // ItemReferenceBox.
+        // Sort the overlay items by dimg_index. dimg_index is the order in which the items appear
+        // in the 'iref' box.
+        overlay_item_ids.sort_by_key(|k| self.items.get(k).unwrap().dimg_index);
+        let item = self.items.get_mut(&item_id).unwrap();
+        item.properties.push(ItemProperty::CodecConfiguration(
+            first_codec_config.unwrap(),
+        ));
+        item.derived_item_ids = overlay_item_ids;
         Ok(())
     }
 
@@ -734,7 +788,7 @@ impl Decoder {
         item.properties.push(ItemProperty::CodecConfiguration(
             first_codec_config.unwrap(),
         ));
-        item.grid_item_ids = grid_item_ids;
+        item.derived_item_ids = grid_item_ids;
         Ok(())
     }
 
@@ -892,22 +946,8 @@ impl Decoder {
                     })
                     .map(|it| *it.0);
 
-                // TODO: b/393135956 - There are some unsupported HEIC primary item types (like
-                // overlay derivation). In that case, try and return the first available HEIC item.
-                // Remove this workaround once overlay derivation is supported.
-                let color_item_id = if cfg!(feature = "heic") && color_item_id.is_none() {
-                    // Look for the first valid HEIC item.
-                    self.items
-                        .iter()
-                        .find(|x| !x.1.should_skip() && x.1.id != 0 && x.1.is_image_item())
-                        .map(|it| *it.0)
-                } else {
-                    color_item_id
-                };
-
                 item_ids[Category::Color.usize()] = color_item_id.ok_or(AvifError::NoContent)?;
                 self.read_and_parse_item(item_ids[Category::Color.usize()], Category::Color)?;
-                self.populate_grid_item_ids(item_ids[Category::Color.usize()], Category::Color)?;
 
                 // Find exif/xmp from meta if any.
                 Self::search_exif_or_xmp_metadata(
@@ -924,7 +964,6 @@ impl Decoder {
                 {
                     if !self.items.get(&alpha_item_id).unwrap().is_made_up {
                         self.read_and_parse_item(alpha_item_id, Category::Alpha)?;
-                        self.populate_grid_item_ids(alpha_item_id, Category::Alpha)?;
                     }
                     item_ids[Category::Alpha.usize()] = alpha_item_id;
                 }
@@ -943,7 +982,6 @@ impl Decoder {
                         if let Some(metadata) = mp4box::parse_tmap(&mut stream)? {
                             self.gainmap.metadata = metadata;
                             self.read_and_parse_item(gainmap_id, Category::Gainmap)?;
-                            self.populate_grid_item_ids(gainmap_id, Category::Gainmap)?;
                             self.gainmap_present = true;
                             if self.settings.image_content_to_decode.gainmap() {
                                 item_ids[Category::Gainmap.usize()] = gainmap_id;
@@ -1127,12 +1165,15 @@ impl Decoder {
         if item_id == 0 {
             return Ok(());
         }
+        self.populate_overlay_item_ids(item_id)?;
         self.items.get_mut(&item_id).unwrap().read_and_parse(
             self.io.unwrap_mut(),
             &mut self.tile_info[category.usize()].grid,
+            &mut self.tile_info[category.usize()].overlay,
             self.settings.image_size_limit,
             self.settings.image_dimension_limit,
-        )
+        )?;
+        self.populate_grid_item_ids(item_id, category)
     }
 
     fn can_use_single_codec(&self) -> AvifResult<bool> {
@@ -1462,8 +1503,70 @@ impl Decoder {
                     )?;
                 }
             }
+        } else if self.tile_info[category.usize()].is_overlay() {
+            if tile_index == 0 {
+                let overlay = &self.tile_info[category.usize()].overlay;
+                let canvas_fill_values =
+                    self.image.convert_rgba16_to_yuva(overlay.canvas_fill_value);
+                match category {
+                    Category::Color => {
+                        self.image.width = overlay.width;
+                        self.image.height = overlay.height;
+                        self.image.copy_properties_from(tile);
+                        self.image
+                            .allocate_planes_with_default_values(category, canvas_fill_values)?;
+                    }
+                    Category::Alpha => {
+                        // Alpha is always just one plane and the depth has been validated
+                        // to be the same as the color planes' depth.
+                        self.image
+                            .allocate_planes_with_default_values(category, canvas_fill_values)?;
+                    }
+                    Category::Gainmap => {
+                        self.gainmap.image.width = overlay.width;
+                        self.gainmap.image.height = overlay.height;
+                        self.gainmap.image.copy_properties_from(tile);
+                        self.gainmap
+                            .image
+                            .allocate_planes_with_default_values(category, canvas_fill_values)?;
+                    }
+                }
+            }
+            if !tiles_slice1.is_empty() {
+                let first_tile_image = &tiles_slice1[0].image;
+                if tile.image.width != first_tile_image.width
+                    || tile.image.height != first_tile_image.height
+                    || tile.image.depth != first_tile_image.depth
+                    || tile.image.yuv_format != first_tile_image.yuv_format
+                    || tile.image.yuv_range != first_tile_image.yuv_range
+                    || tile.image.color_primaries != first_tile_image.color_primaries
+                    || tile.image.transfer_characteristics
+                        != first_tile_image.transfer_characteristics
+                    || tile.image.matrix_coefficients != first_tile_image.matrix_coefficients
+                {
+                    return Err(AvifError::InvalidImageGrid(
+                        "overlay image contains mismatched tiles".into(),
+                    ));
+                }
+            }
+            match category {
+                Category::Gainmap => self.gainmap.image.copy_and_overlay_from_tile(
+                    &tile.image,
+                    &self.tile_info[category.usize()],
+                    tile_index as u32,
+                    category,
+                )?,
+                _ => {
+                    self.image.copy_and_overlay_from_tile(
+                        &tile.image,
+                        &self.tile_info[category.usize()],
+                        tile_index as u32,
+                        category,
+                    )?;
+                }
+            }
         } else {
-            // Non grid path, steal or copy planes from the only tile.
+            // Non grid/overlay path, steal or copy planes from the only tile.
             match category {
                 Category::Color => {
                     self.image.width = tile.image.width;
