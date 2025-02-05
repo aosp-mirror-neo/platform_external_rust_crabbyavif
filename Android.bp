@@ -79,6 +79,10 @@ rust_library {
     whole_static_libs: [
         "libyuv",
     ],
+    shared_libs: [
+        "libjpeg",
+        "libc++",
+    ],
 }
 
 rust_ffi_static {
