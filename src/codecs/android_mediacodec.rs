@@ -77,6 +77,19 @@ impl PlaneInfo {
 }
 
 impl MediaFormat {
+    // These constants are documented in
+    // https://developer.android.com/reference/android/media/MediaFormat
+    const COLOR_RANGE_LIMITED: i32 = 2;
+
+    const COLOR_STANDARD_BT709: i32 = 1;
+    const COLOR_STANDARD_BT601_PAL: i32 = 2;
+    const COLOR_STANDARD_BT601_NTSC: i32 = 4;
+    const COLOR_STANDARD_BT2020: i32 = 6;
+
+    const COLOR_TRANSFER_LINEAR: i32 = 1;
+    const COLOR_TRANSFER_SDR_VIDEO: i32 = 3;
+    const COLOR_TRANSFER_HLG: i32 = 7;
+
     fn get_i32(&self, key: *const c_char) -> Option<i32> {
         let mut value: i32 = 0;
         match unsafe { AMediaFormat_getInt32(self.format, key, &mut value as *mut _) } {
@@ -118,11 +131,38 @@ impl MediaFormat {
     fn color_range(&self) -> YuvRange {
         // color-range is documented but isn't exposed as a constant in the NDK:
         // https://developer.android.com/reference/android/media/MediaFormat#KEY_COLOR_RANGE
-        let color_range = self.get_i32_from_str("color-range").unwrap_or(2);
-        if color_range == 0 {
+        let color_range = self
+            .get_i32_from_str("color-range")
+            .unwrap_or(Self::COLOR_RANGE_LIMITED);
+        if color_range == Self::COLOR_RANGE_LIMITED {
             YuvRange::Limited
         } else {
             YuvRange::Full
+        }
+    }
+
+    fn color_primaries(&self) -> ColorPrimaries {
+        // color-standard is documented but isn't exposed as a constant in the NDK:
+        // https://developer.android.com/reference/android/media/MediaFormat#KEY_COLOR_STANDARD
+        let color_standard = self.get_i32_from_str("color-standard").unwrap_or(-1);
+        match color_standard {
+            Self::COLOR_STANDARD_BT709 => ColorPrimaries::Bt709,
+            Self::COLOR_STANDARD_BT2020 => ColorPrimaries::Bt2020,
+            Self::COLOR_STANDARD_BT601_PAL | Self::COLOR_STANDARD_BT601_NTSC => {
+                ColorPrimaries::Bt601
+            }
+            _ => ColorPrimaries::Unspecified,
+        }
+    }
+
+    fn transfer_characteristics(&self) -> TransferCharacteristics {
+        // color-transfer is documented but isn't exposed as a constant in the NDK:
+        // https://developer.android.com/reference/android/media/MediaFormat#KEY_COLOR_TRANSFER
+        match self.get_i32_from_str("color-transfer").unwrap_or(-1) {
+            Self::COLOR_TRANSFER_LINEAR => TransferCharacteristics::Linear,
+            Self::COLOR_TRANSFER_HLG => TransferCharacteristics::Hlg,
+            Self::COLOR_TRANSFER_SDR_VIDEO => TransferCharacteristics::Bt601,
+            _ => TransferCharacteristics::Unspecified,
         }
     }
 
@@ -302,20 +342,21 @@ fn get_codec_initializers(config: &DecoderConfig) -> Vec<CodecInitializer> {
 #[derive(Default)]
 pub struct MediaCodec {
     codec: Option<*mut AMediaCodec>,
+    codec_index: usize,
     format: Option<MediaFormat>,
     output_buffer_index: Option<usize>,
     config: Option<DecoderConfig>,
+    codec_initializers: Vec<CodecInitializer>,
 }
 
 impl MediaCodec {
     const AV1_MIME: &str = "video/av01";
     const HEVC_MIME: &str = "video/hevc";
-}
 
-impl Decoder for MediaCodec {
-    fn initialize(&mut self, config: &DecoderConfig) -> AvifResult<()> {
-        if self.codec.is_some() {
-            return Ok(()); // Already initialized.
+    fn initialize_impl(&mut self) -> AvifResult<()> {
+        let config = self.config.unwrap_ref();
+        if self.codec_index >= self.codec_initializers.len() {
+            return Err(AvifError::NoCodecAvailable);
         }
         let format = unsafe { AMediaFormat_new() };
         if format.is_null() {
@@ -363,51 +404,42 @@ impl Decoder for MediaCodec {
             }
         }
 
-        let mut codec = ptr::null_mut();
-        for codec_initializer in get_codec_initializers(config) {
-            codec = match codec_initializer {
-                CodecInitializer::ByName(name) => {
-                    c_str!(codec_name, codec_name_tmp, name.as_str());
-                    unsafe { AMediaCodec_createCodecByName(codec_name) }
-                }
-                CodecInitializer::ByMimeType(mime_type) => {
-                    c_str!(codec_mime, codec_mime_tmp, mime_type.as_str());
-                    unsafe { AMediaCodec_createDecoderByType(codec_mime) }
-                }
-            };
-            if codec.is_null() {
-                continue;
+        let codec = match &self.codec_initializers[self.codec_index] {
+            CodecInitializer::ByName(name) => {
+                c_str!(codec_name, codec_name_tmp, name.as_str());
+                unsafe { AMediaCodec_createCodecByName(codec_name) }
             }
-            let status = unsafe {
-                AMediaCodec_configure(codec, format, ptr::null_mut(), ptr::null_mut(), 0)
-            };
-            if status != media_status_t_AMEDIA_OK {
-                unsafe {
-                    AMediaCodec_delete(codec);
-                }
-                codec = ptr::null_mut();
-                continue;
+            CodecInitializer::ByMimeType(mime_type) => {
+                c_str!(codec_mime, codec_mime_tmp, mime_type.as_str());
+                unsafe { AMediaCodec_createDecoderByType(codec_mime) }
             }
-            let status = unsafe { AMediaCodec_start(codec) };
-            if status != media_status_t_AMEDIA_OK {
-                unsafe {
-                    AMediaCodec_delete(codec);
-                }
-                codec = ptr::null_mut();
-                continue;
-            }
-            break;
-        }
+        };
         if codec.is_null() {
             unsafe { AMediaFormat_delete(format) };
             return Err(AvifError::NoCodecAvailable);
         }
+        let status =
+            unsafe { AMediaCodec_configure(codec, format, ptr::null_mut(), ptr::null_mut(), 0) };
+        if status != media_status_t_AMEDIA_OK {
+            unsafe {
+                AMediaCodec_delete(codec);
+                AMediaFormat_delete(format);
+            }
+            return Err(AvifError::NoCodecAvailable);
+        }
+        let status = unsafe { AMediaCodec_start(codec) };
+        if status != media_status_t_AMEDIA_OK {
+            unsafe {
+                AMediaCodec_delete(codec);
+                AMediaFormat_delete(format);
+            }
+            return Err(AvifError::NoCodecAvailable);
+        }
         self.codec = Some(codec);
-        self.config = Some(config.clone());
         Ok(())
     }
 
-    fn get_next_image(
+    fn get_next_image_impl(
         &mut self,
         payload: &[u8],
         _spatial_id: u8,
@@ -415,7 +447,7 @@ impl Decoder for MediaCodec {
         category: Category,
     ) -> AvifResult<()> {
         if self.codec.is_none() {
-            self.initialize(&DecoderConfig::default())?;
+            self.initialize_impl()?;
         }
         let codec = self.codec.unwrap();
         if self.output_buffer_index.is_some() {
@@ -547,9 +579,16 @@ impl Decoder for MediaCodec {
             }
             _ => {
                 image.chroma_sample_position = ChromaSamplePosition::Unknown;
-                image.color_primaries = ColorPrimaries::Unspecified;
-                image.transfer_characteristics = TransferCharacteristics::Unspecified;
-                image.matrix_coefficients = MatrixCoefficients::Unspecified;
+                image.color_primaries = format.color_primaries();
+                image.transfer_characteristics = format.transfer_characteristics();
+                // MediaCodec does not expose matrix coefficients. Try to infer that based on color
+                // primaries to get the most accurate color conversion possible.
+                image.matrix_coefficients = match image.color_primaries {
+                    ColorPrimaries::Bt601 => MatrixCoefficients::Bt601,
+                    ColorPrimaries::Bt709 => MatrixCoefficients::Bt709,
+                    ColorPrimaries::Bt2020 => MatrixCoefficients::Bt2020Ncl,
+                    _ => MatrixCoefficients::Unspecified,
+                };
 
                 for i in 0usize..3 {
                     if i == 2
@@ -575,6 +614,58 @@ impl Decoder for MediaCodec {
             }
         }
         Ok(())
+    }
+
+    fn drop_impl(&mut self) {
+        if self.codec.is_some() {
+            if self.output_buffer_index.is_some() {
+                unsafe {
+                    AMediaCodec_releaseOutputBuffer(
+                        self.codec.unwrap(),
+                        self.output_buffer_index.unwrap(),
+                        false,
+                    );
+                }
+                self.output_buffer_index = None;
+            }
+            unsafe {
+                AMediaCodec_stop(self.codec.unwrap());
+                AMediaCodec_delete(self.codec.unwrap());
+            }
+            self.codec = None;
+        }
+        self.format = None;
+    }
+}
+
+impl Decoder for MediaCodec {
+    fn initialize(&mut self, config: &DecoderConfig) -> AvifResult<()> {
+        self.codec_initializers = get_codec_initializers(config);
+        self.config = Some(config.clone());
+        // Actual codec initialization will be performed in get_next_image since we may try
+        // multiple codecs.
+        Ok(())
+    }
+
+    fn get_next_image(
+        &mut self,
+        payload: &[u8],
+        spatial_id: u8,
+        image: &mut Image,
+        category: Category,
+    ) -> AvifResult<()> {
+        while self.codec_index < self.codec_initializers.len() {
+            let res = self.get_next_image_impl(payload, spatial_id, image, category);
+            if res.is_ok() {
+                return Ok(());
+            }
+            // Drop the current codec and try the next one.
+            self.drop_impl();
+            self.codec_index += 1;
+        }
+        Err(AvifError::UnknownError(
+            "all the codecs failed to extract an image".into(),
+        ))
     }
 }
 
@@ -613,23 +704,6 @@ impl Drop for MediaFormat {
 
 impl Drop for MediaCodec {
     fn drop(&mut self) {
-        if self.codec.is_some() {
-            if self.output_buffer_index.is_some() {
-                unsafe {
-                    AMediaCodec_releaseOutputBuffer(
-                        self.codec.unwrap(),
-                        self.output_buffer_index.unwrap(),
-                        false,
-                    );
-                }
-                self.output_buffer_index = None;
-            }
-            unsafe {
-                AMediaCodec_stop(self.codec.unwrap());
-                AMediaCodec_delete(self.codec.unwrap());
-            }
-            self.codec = None;
-        }
-        self.format = None;
+        self.drop_impl();
     }
 }

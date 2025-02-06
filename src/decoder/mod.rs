@@ -51,7 +51,7 @@ pub trait IO {
 }
 
 impl dyn IO {
-    pub fn read_exact(&mut self, offset: u64, read_size: usize) -> AvifResult<&[u8]> {
+    pub(crate) fn read_exact(&mut self, offset: u64, read_size: usize) -> AvifResult<&[u8]> {
         let result = self.read(offset, read_size)?;
         if result.len() < read_size {
             Err(AvifError::TruncatedData)
@@ -135,7 +135,7 @@ pub enum ImageContentType {
 }
 
 impl ImageContentType {
-    pub fn categories(&self) -> Vec<Category> {
+    pub(crate) fn categories(&self) -> Vec<Category> {
         match self {
             Self::None => vec![],
             Self::ColorAndAlpha => vec![Category::Color, Category::Alpha],
@@ -144,7 +144,7 @@ impl ImageContentType {
         }
     }
 
-    pub fn gainmap(&self) -> bool {
+    pub(crate) fn gainmap(&self) -> bool {
         matches!(self, Self::GainMap | Self::All)
     }
 }
@@ -228,7 +228,7 @@ pub enum Strictness {
 }
 
 impl Strictness {
-    pub fn pixi_required(&self) -> bool {
+    pub(crate) fn pixi_required(&self) -> bool {
         match self {
             Strictness::All => true,
             Strictness::SpecificInclude(flags) => flags
@@ -241,7 +241,7 @@ impl Strictness {
         }
     }
 
-    pub fn alpha_ispe_required(&self) -> bool {
+    pub(crate) fn alpha_ispe_required(&self) -> bool {
         match self {
             Strictness::All => true,
             Strictness::SpecificInclude(flags) => flags
@@ -329,7 +329,7 @@ impl Category {
     const ALL: [Category; Category::COUNT] = [Self::Color, Self::Alpha, Self::Gainmap];
     const ALL_USIZE: [usize; Category::COUNT] = [0, 1, 2];
 
-    pub fn usize(self) -> usize {
+    pub(crate) fn usize(self) -> usize {
         match self {
             Category::Color => 0,
             Category::Alpha => 1,
@@ -337,21 +337,12 @@ impl Category {
         }
     }
 
-    pub fn planes(&self) -> &[Plane] {
+    pub(crate) fn planes(&self) -> &[Plane] {
         match self {
             Category::Alpha => &A_PLANE,
             _ => &YUV_PLANES,
         }
     }
-}
-
-macro_rules! find_property {
-    ($properties:expr, $property_name:ident) => {
-        $properties.iter().find_map(|p| match p {
-            ItemProperty::$property_name(value) => Some(value.clone()),
-            _ => None,
-        })
-    };
 }
 
 impl Decoder {
@@ -426,13 +417,13 @@ impl Decoder {
         }) {
             return Ok(Some(*item.0));
         }
-        if color_item.item_type != "grid" || color_item.grid_item_ids.is_empty() {
+        if color_item.item_type != "grid" || color_item.derived_item_ids.is_empty() {
             return Ok(None);
         }
         // If color item is a grid, check if there is an alpha channel which is represented as an
         // auxl item to each color tile item.
-        let mut alpha_item_indices: Vec<u32> = create_vec_exact(color_item.grid_item_ids.len())?;
-        for color_grid_item_id in &color_item.grid_item_ids {
+        let mut alpha_item_indices: Vec<u32> = create_vec_exact(color_item.derived_item_ids.len())?;
+        for color_grid_item_id in &color_item.derived_item_ids {
             match self
                 .items
                 .iter()
@@ -468,7 +459,7 @@ impl Decoder {
             item_type: String::from("grid"),
             width: color_item.width,
             height: color_item.height,
-            grid_item_ids: alpha_item_indices,
+            derived_item_ids: alpha_item_indices,
             properties,
             is_made_up: true,
             ..Item::default()
@@ -604,7 +595,7 @@ impl Decoder {
             .items
             .get(&item_id)
             .ok_or(AvifError::MissingImageItem)?;
-        if item.grid_item_ids.is_empty() {
+        if item.derived_item_ids.is_empty() {
             if item.size == 0 {
                 return Err(AvifError::MissingImageItem);
             }
@@ -617,30 +608,32 @@ impl Decoder {
             tile.input.category = category;
             tiles.push(tile);
         } else {
-            if !self.tile_info[category.usize()].is_grid() {
+            if !self.tile_info[category.usize()].is_grid()
+                && !self.tile_info[category.usize()].is_overlay()
+            {
                 return Err(AvifError::InvalidImageGrid(
-                    "dimg items were found but image is not grid.".into(),
+                    "dimg items were found but image is not grid or overlay.".into(),
                 ));
             }
             let mut progressive = true;
-            for grid_item_id in item.grid_item_ids.clone() {
-                let grid_item = self
+            for derived_item_id in item.derived_item_ids.clone() {
+                let derived_item = self
                     .items
-                    .get_mut(&grid_item_id)
-                    .ok_or(AvifError::InvalidImageGrid("missing grid item".into()))?;
+                    .get_mut(&derived_item_id)
+                    .ok_or(AvifError::InvalidImageGrid("missing derived item".into()))?;
                 let mut tile = Tile::create_from_item(
-                    grid_item,
+                    derived_item,
                     self.settings.allow_progressive,
                     self.settings.image_count_limit,
                     self.io.unwrap_ref().size_hint(),
                 )?;
                 tile.input.category = category;
                 tiles.push(tile);
-                progressive = progressive && grid_item.progressive;
+                progressive = progressive && derived_item.progressive;
             }
 
             if category == Category::Color && progressive {
-                // Propagate the progressive status to the top-level grid item.
+                // Propagate the progressive status to the top-level item.
                 self.items.get_mut(&item_id).unwrap().progressive = true;
             }
         }
@@ -682,6 +675,62 @@ impl Decoder {
             }
             search_size += 64;
         }
+        Ok(())
+    }
+
+    fn populate_overlay_item_ids(&mut self, item_id: u32) -> AvifResult<()> {
+        if self.items.get(&item_id).unwrap().item_type != "iovl" {
+            return Ok(());
+        }
+        let mut overlay_item_ids: Vec<u32> = vec![];
+        let mut first_codec_config: Option<CodecConfiguration> = None;
+        // Collect all the dimg items.
+        for dimg_item_id in self.items.keys() {
+            if *dimg_item_id == item_id {
+                continue;
+            }
+            let dimg_item = self
+                .items
+                .get(dimg_item_id)
+                .ok_or(AvifError::InvalidImageGrid("".into()))?;
+            if dimg_item.dimg_for_id != item_id {
+                continue;
+            }
+            if !dimg_item.is_image_codec_item() || dimg_item.has_unsupported_essential_property {
+                return Err(AvifError::InvalidImageGrid(
+                    "invalid input item in dimg grid".into(),
+                ));
+            }
+            if first_codec_config.is_none() {
+                // Adopt the configuration property of the first tile.
+                // validate_properties() makes sure they are all equal.
+                first_codec_config = Some(
+                    dimg_item
+                        .codec_config()
+                        .ok_or(AvifError::BmffParseFailed(
+                            "missing codec config property".into(),
+                        ))?
+                        .clone(),
+                );
+            }
+            overlay_item_ids.push(*dimg_item_id);
+        }
+        if first_codec_config.is_none() {
+            // No derived images were found.
+            return Ok(());
+        }
+        // ISO/IEC 23008-12: The input images are listed in the order they are layered, i.e. the
+        // bottom-most input image first and the top-most input image last, in the
+        // SingleItemTypeReferenceBox of type 'dimg' for this derived image item within the
+        // ItemReferenceBox.
+        // Sort the overlay items by dimg_index. dimg_index is the order in which the items appear
+        // in the 'iref' box.
+        overlay_item_ids.sort_by_key(|k| self.items.get(k).unwrap().dimg_index);
+        let item = self.items.get_mut(&item_id).unwrap();
+        item.properties.push(ItemProperty::CodecConfiguration(
+            first_codec_config.unwrap(),
+        ));
+        item.derived_item_ids = overlay_item_ids;
         Ok(())
     }
 
@@ -743,7 +792,7 @@ impl Decoder {
         item.properties.push(ItemProperty::CodecConfiguration(
             first_codec_config.unwrap(),
         ));
-        item.grid_item_ids = grid_item_ids;
+        item.derived_item_ids = grid_item_ids;
         Ok(())
     }
 
@@ -903,7 +952,6 @@ impl Decoder {
 
                 item_ids[Category::Color.usize()] = color_item_id.ok_or(AvifError::NoContent)?;
                 self.read_and_parse_item(item_ids[Category::Color.usize()], Category::Color)?;
-                self.populate_grid_item_ids(item_ids[Category::Color.usize()], Category::Color)?;
 
                 // Find exif/xmp from meta if any.
                 Self::search_exif_or_xmp_metadata(
@@ -920,7 +968,6 @@ impl Decoder {
                 {
                     if !self.items.get(&alpha_item_id).unwrap().is_made_up {
                         self.read_and_parse_item(alpha_item_id, Category::Alpha)?;
-                        self.populate_grid_item_ids(alpha_item_id, Category::Alpha)?;
                     }
                     item_ids[Category::Alpha.usize()] = alpha_item_id;
                 }
@@ -930,6 +977,8 @@ impl Decoder {
                     if let Some((tonemap_id, gainmap_id)) =
                         self.find_gainmap_item(item_ids[Category::Color.usize()])?
                     {
+                        self.validate_gainmap_item(gainmap_id, tonemap_id)?;
+                        self.read_and_parse_item(gainmap_id, Category::Gainmap)?;
                         let tonemap_item = self
                             .items
                             .get_mut(&tonemap_id)
@@ -937,9 +986,6 @@ impl Decoder {
                         let mut stream = tonemap_item.stream(self.io.unwrap_mut())?;
                         if let Some(metadata) = mp4box::parse_tmap(&mut stream)? {
                             self.gainmap.metadata = metadata;
-                            self.read_and_parse_item(gainmap_id, Category::Gainmap)?;
-                            self.populate_grid_item_ids(gainmap_id, Category::Gainmap)?;
-                            self.validate_gainmap_item(gainmap_id, tonemap_id)?;
                             self.gainmap_present = true;
                             if self.settings.image_content_to_decode.gainmap() {
                                 item_ids[Category::Gainmap.usize()] = gainmap_id;
@@ -1123,12 +1169,15 @@ impl Decoder {
         if item_id == 0 {
             return Ok(());
         }
+        self.populate_overlay_item_ids(item_id)?;
         self.items.get_mut(&item_id).unwrap().read_and_parse(
             self.io.unwrap_mut(),
             &mut self.tile_info[category.usize()].grid,
+            &mut self.tile_info[category.usize()].overlay,
             self.settings.image_size_limit,
             self.settings.image_dimension_limit,
-        )
+        )?;
+        self.populate_grid_item_ids(item_id, category)
     }
 
     fn can_use_single_codec(&self) -> AvifResult<bool> {
@@ -1181,6 +1230,7 @@ impl Decoder {
             height: tile.height,
             depth: self.image.depth,
             max_threads: self.settings.max_threads,
+            image_size_limit: self.settings.image_size_limit,
             max_input_size: tile.max_sample_size(),
             codec_config: tile.codec_config.clone(),
             category,
@@ -1376,7 +1426,23 @@ impl Decoder {
             &self.items.get(&sample.item_id).unwrap().data_buffer
         };
         let data = sample.data(io, item_data_buffer)?;
-        codec.get_next_image(data, sample.spatial_id, &mut tile.image, category)?;
+        let next_image_result =
+            codec.get_next_image(data, sample.spatial_id, &mut tile.image, category);
+        if next_image_result.is_err() {
+            if cfg!(feature = "android_mediacodec")
+                && cfg!(feature = "heic")
+                && tile.codec_config.is_heic()
+                && category == Category::Alpha
+            {
+                // When decoding HEIC on Android, if the alpha channel decoding fails, simply
+                // ignore it and return the rest of the image.
+                checked_incr!(self.tile_info[category.usize()].decoded_tile_count, 1);
+                return Ok(());
+            } else {
+                return next_image_result;
+            }
+        }
+
         checked_incr!(self.tile_info[category.usize()].decoded_tile_count, 1);
 
         if category == Category::Alpha && tile.image.yuv_range == YuvRange::Limited {
@@ -1392,9 +1458,7 @@ impl Decoder {
                     Category::Color => {
                         self.image.width = grid.width;
                         self.image.height = grid.height;
-                        // Adopt the yuv_format and depth.
-                        self.image.yuv_format = tile.image.yuv_format;
-                        self.image.depth = tile.image.depth;
+                        self.image.copy_properties_from(tile);
                         self.image.allocate_planes(category)?;
                     }
                     Category::Alpha => {
@@ -1405,9 +1469,7 @@ impl Decoder {
                     Category::Gainmap => {
                         self.gainmap.image.width = grid.width;
                         self.gainmap.image.height = grid.height;
-                        // Adopt the yuv_format and depth.
-                        self.gainmap.image.yuv_format = tile.image.yuv_format;
-                        self.gainmap.image.depth = tile.image.depth;
+                        self.gainmap.image.copy_properties_from(tile);
                         self.gainmap.image.allocate_planes(category)?;
                     }
                 }
@@ -1445,30 +1507,92 @@ impl Decoder {
                     )?;
                 }
             }
+        } else if self.tile_info[category.usize()].is_overlay() {
+            if tile_index == 0 {
+                let overlay = &self.tile_info[category.usize()].overlay;
+                let canvas_fill_values =
+                    self.image.convert_rgba16_to_yuva(overlay.canvas_fill_value);
+                match category {
+                    Category::Color => {
+                        self.image.width = overlay.width;
+                        self.image.height = overlay.height;
+                        self.image.copy_properties_from(tile);
+                        self.image
+                            .allocate_planes_with_default_values(category, canvas_fill_values)?;
+                    }
+                    Category::Alpha => {
+                        // Alpha is always just one plane and the depth has been validated
+                        // to be the same as the color planes' depth.
+                        self.image
+                            .allocate_planes_with_default_values(category, canvas_fill_values)?;
+                    }
+                    Category::Gainmap => {
+                        self.gainmap.image.width = overlay.width;
+                        self.gainmap.image.height = overlay.height;
+                        self.gainmap.image.copy_properties_from(tile);
+                        self.gainmap
+                            .image
+                            .allocate_planes_with_default_values(category, canvas_fill_values)?;
+                    }
+                }
+            }
+            if !tiles_slice1.is_empty() {
+                let first_tile_image = &tiles_slice1[0].image;
+                if tile.image.width != first_tile_image.width
+                    || tile.image.height != first_tile_image.height
+                    || tile.image.depth != first_tile_image.depth
+                    || tile.image.yuv_format != first_tile_image.yuv_format
+                    || tile.image.yuv_range != first_tile_image.yuv_range
+                    || tile.image.color_primaries != first_tile_image.color_primaries
+                    || tile.image.transfer_characteristics
+                        != first_tile_image.transfer_characteristics
+                    || tile.image.matrix_coefficients != first_tile_image.matrix_coefficients
+                {
+                    return Err(AvifError::InvalidImageGrid(
+                        "overlay image contains mismatched tiles".into(),
+                    ));
+                }
+            }
+            match category {
+                Category::Gainmap => self.gainmap.image.copy_and_overlay_from_tile(
+                    &tile.image,
+                    &self.tile_info[category.usize()],
+                    tile_index as u32,
+                    category,
+                )?,
+                _ => {
+                    self.image.copy_and_overlay_from_tile(
+                        &tile.image,
+                        &self.tile_info[category.usize()],
+                        tile_index as u32,
+                        category,
+                    )?;
+                }
+            }
         } else {
-            // Non grid path, steal or copy planes from the only tile.
+            // Non grid/overlay path, steal or copy planes from the only tile.
             match category {
                 Category::Color => {
                     self.image.width = tile.image.width;
                     self.image.height = tile.image.height;
-                    self.image.depth = tile.image.depth;
-                    self.image.yuv_format = tile.image.yuv_format;
-                    self.image.steal_or_copy_from(&tile.image, category)?;
+                    self.image.copy_properties_from(tile);
+                    self.image
+                        .steal_or_copy_planes_from(&tile.image, category)?;
                 }
                 Category::Alpha => {
                     if !self.image.has_same_properties(&tile.image) {
                         return Err(AvifError::DecodeAlphaFailed);
                     }
-                    self.image.steal_or_copy_from(&tile.image, category)?;
+                    self.image
+                        .steal_or_copy_planes_from(&tile.image, category)?;
                 }
                 Category::Gainmap => {
                     self.gainmap.image.width = tile.image.width;
                     self.gainmap.image.height = tile.image.height;
-                    self.gainmap.image.depth = tile.image.depth;
-                    self.gainmap.image.yuv_format = tile.image.yuv_format;
+                    self.gainmap.image.copy_properties_from(tile);
                     self.gainmap
                         .image
-                        .steal_or_copy_from(&tile.image, category)?;
+                        .steal_or_copy_planes_from(&tile.image, category)?;
                 }
             }
         }
@@ -1582,6 +1706,9 @@ impl Decoder {
             .iter()
             .find(|x| x.id == color_track_id)
             .ok_or(AvifError::NoContent)?;
+        if color_track.sample_table.is_none() {
+            return Ok(self.image_timing);
+        }
         color_track.image_timing(n)
     }
 
