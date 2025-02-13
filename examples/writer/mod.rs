@@ -1,4 +1,4 @@
-// Copyright 2024 Google LLC
+// Copyright 2025 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,4 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod clap;
+// Not all sub-modules are used by all targets. Ignore dead code warnings.
+#![allow(dead_code)]
+
+pub(crate) mod jpeg;
+pub(crate) mod png;
+pub(crate) mod y4m;
+
+use crabby_avif::image::Image;
+use crabby_avif::AvifResult;
+
+use std::fs::File;
+
+pub trait Writer {
+    fn write_frame(&mut self, file: &mut File, image: &Image) -> AvifResult<()>;
+}

@@ -26,7 +26,10 @@ seq-macro = "0.3.5"
 tempfile = "3.8.1"
 exitcode = "1.1.2"
 rand = "0.8.5"
-image = "0.25.2"
+clap = { version = "4.5.28", features = ["derive"] }
+clap_derive = { version = "4.5.28" }
+png = "0.17.16"
+image = { version = "0.24.0", features = ["jpeg"] }
 
 [build-dependencies]
 bindgen = "0.69.1"
