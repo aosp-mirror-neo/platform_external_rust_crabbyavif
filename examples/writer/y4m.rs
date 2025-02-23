@@ -12,37 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[allow(unused_imports)]
 use crate::image::*;
 use crate::*;
+
 use std::fs::File;
 use std::io::prelude::*;
 
+use super::Writer;
+
 #[derive(Default)]
-pub struct Y4MWriter {
-    pub filename: Option<String>,
+pub(crate) struct Y4MWriter {
     header_written: bool,
-    file: Option<File>,
     write_alpha: bool,
+    skip_headers: bool,
 }
 
 impl Y4MWriter {
-    pub fn create(filename: &str) -> Self {
+    #[allow(unused)]
+    pub(crate) fn create(skip_headers: bool) -> Self {
         Self {
-            filename: Some(filename.to_owned()),
-            ..Self::default()
+            skip_headers,
+            ..Default::default()
         }
     }
 
-    pub fn create_from_file(file: File) -> Self {
-        Self {
-            file: Some(file),
-            ..Self::default()
-        }
-    }
-
-    fn write_header(&mut self, image: &Image) -> bool {
+    fn write_header(&mut self, file: &mut File, image: &Image) -> AvifResult<()> {
         if self.header_written {
-            return true;
+            return Ok(());
         }
         self.write_alpha = false;
 
@@ -89,7 +86,7 @@ impl Y4MWriter {
                 PixelFormat::Yuv400 => "Cmono12 XYSCSS=400",
             },
             _ => {
-                return false;
+                return Err(AvifError::NotImplemented);
             }
         };
         let y4m_color_range = if image.yuv_range == YuvRange::Limited {
@@ -101,33 +98,20 @@ impl Y4MWriter {
             "YUV4MPEG2 W{} H{} F25:1 Ip A0:0 {y4m_format} {y4m_color_range}\n",
             image.width, image.height
         );
-        if self.file.is_none() {
-            assert!(self.filename.is_some());
-            let file = File::create(self.filename.unwrap_ref());
-            if file.is_err() {
-                return false;
-            }
-            self.file = Some(file.unwrap());
-        }
-        if self.file.unwrap_ref().write_all(header.as_bytes()).is_err() {
-            return false;
-        }
+        file.write_all(header.as_bytes())
+            .or(Err(AvifError::IoError))?;
         self.header_written = true;
-        true
+        Ok(())
     }
+}
 
-    pub fn write_frame(&mut self, image: &Image) -> bool {
-        if !self.write_header(image) {
-            return false;
-        }
-        let frame_marker = "FRAME\n";
-        if self
-            .file
-            .unwrap_ref()
-            .write_all(frame_marker.as_bytes())
-            .is_err()
-        {
-            return false;
+impl Writer for Y4MWriter {
+    fn write_frame(&mut self, file: &mut File, image: &Image) -> AvifResult<()> {
+        if !self.skip_headers {
+            self.write_header(file, image)?;
+            let frame_marker = "FRAME\n";
+            file.write_all(frame_marker.as_bytes())
+                .or(Err(AvifError::IoError))?;
         }
         let planes: &[Plane] = if self.write_alpha { &ALL_PLANES } else { &YUV_PLANES };
         for plane in planes {
@@ -137,35 +121,23 @@ impl Y4MWriter {
             }
             if image.depth == 8 {
                 for y in 0..image.height(plane) {
-                    let row = if let Ok(row) = image.row(plane, y as u32) {
-                        row
-                    } else {
-                        return false;
-                    };
+                    let row = image.row(plane, y as u32)?;
                     let pixels = &row[..image.width(plane)];
-                    if self.file.unwrap_ref().write_all(pixels).is_err() {
-                        return false;
-                    }
+                    file.write_all(pixels).or(Err(AvifError::IoError))?;
                 }
             } else {
                 for y in 0..image.height(plane) {
-                    let row16 = if let Ok(row16) = image.row16(plane, y as u32) {
-                        row16
-                    } else {
-                        return false;
-                    };
+                    let row16 = image.row16(plane, y as u32)?;
                     let pixels16 = &row16[..image.width(plane)];
                     let mut pixels: Vec<u8> = Vec::new();
                     // y4m is always little endian.
                     for &pixel16 in pixels16 {
                         pixels.extend_from_slice(&pixel16.to_le_bytes());
                     }
-                    if self.file.unwrap_ref().write_all(&pixels[..]).is_err() {
-                        return false;
-                    }
+                    file.write_all(&pixels[..]).or(Err(AvifError::IoError))?;
                 }
             }
         }
-        true
+        Ok(())
     }
 }
