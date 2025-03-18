@@ -20,9 +20,9 @@ rust_bindgen {
     ],
     bindgen_flags: [
         "--allowlist-item=android::MediaImage2?",
-        "--no-recursive-allowlist",
-        "--no-layout-tests",
         "--no-doc-comments",
+        "--no-layout-tests",
+        "--no-recursive-allowlist",
     ],
 }
 
@@ -47,6 +47,8 @@ rust_library {
     cfgs: ["android_soong"],
     srcs: [
         "sys/ndk-sys/src/lib.rs",
+        // This comment prevents bpfmt -s from sorting this list as lib.rs
+        // always has to be the first in the source list.
         ":libcrabbyavif_ndk_bindgen",
     ],
     shared_libs: [
@@ -74,14 +76,16 @@ rust_library {
     cfgs: ["android_soong"],
     srcs: [
         "sys/libyuv-sys/src/lib.rs",
+        // This comment prevents bpfmt -s from sorting this list as lib.rs
+        // always has to be the first in the source list.
         ":libcrabbyavif_yuv_bindgen",
     ],
     whole_static_libs: [
         "libyuv",
     ],
     shared_libs: [
-        "libjpeg",
         "libc++",
+        "libjpeg",
     ],
 }
 
@@ -92,20 +96,22 @@ rust_ffi_static {
     cargo_pkg_version: "0.1.0",
     srcs: [
         "src/lib.rs",
+        // This comment prevents bpfmt -s from sorting this list as lib.rs
+        // always has to be the first in the source list.
         ":libcrabbyavif_mediaimage2_bindgen",
     ],
     cfgs: ["android_soong"],
     edition: "2021",
     features: [
         "android_mediacodec",
-        "libyuv",
         "capi",
         "heic",
+        "libyuv",
     ],
     rustlibs: [
-        "liblogger",
-        "liblog_rust",
         "liblibyuv_sys",
+        "liblog_rust",
+        "liblogger",
         "libndk_sys",
         "librustutils",
     ],
@@ -114,7 +120,7 @@ rust_ffi_static {
     ],
     include_dirs: ["include"],
     apex_available: [
-        "//apex_available:platform",
         "//apex_available:anyapex",
+        "//apex_available:platform",
     ],
 }
