@@ -412,9 +412,11 @@ impl MediaCodec {
                 format,
                 AMEDIAFORMAT_KEY_COLOR_FORMAT,
                 if config.depth == 8 {
+                    // For 8-bit images, always use Yuv420Flexible.
                     AndroidMediaCodecOutputColorFormat::Yuv420Flexible
                 } else {
-                    AndroidMediaCodecOutputColorFormat::P010
+                    // For all other images, use whatever format is requested.
+                    config.android_mediacodec_output_color_format
                 } as i32,
             );
             if low_latency {
@@ -743,7 +745,7 @@ impl MediaCodec {
                             &mut cell_image,
                             grid_image_helper.category,
                         )?;
-                        grid_image_helper.copy_from_cell_image(&cell_image)?;
+                        grid_image_helper.copy_from_cell_image(&mut cell_image)?;
                         if !grid_image_helper.is_grid_complete()? {
                             // The last output buffer will be released when the codec is dropped.
                             AMediaCodec_releaseOutputBuffer(codec, output_index as _, false);
