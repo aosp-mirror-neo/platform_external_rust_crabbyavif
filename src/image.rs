@@ -12,13 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::decoder::tile::Tile;
 use crate::decoder::tile::TileInfo;
-use crate::decoder::Category;
 use crate::decoder::ProgressiveState;
 use crate::internal_utils::pixels::*;
 use crate::internal_utils::*;
-use crate::parser::mp4box::*;
+use crate::parser::mp4box::CodecConfiguration;
 use crate::reformat::coeffs::*;
 use crate::utils::clap::CleanAperture;
 use crate::*;
@@ -118,6 +116,33 @@ pub enum PlaneRow<'a> {
 }
 
 impl Image {
+    pub(crate) fn shallow_clone(&self) -> Self {
+        Self {
+            width: self.width,
+            height: self.height,
+            depth: self.depth,
+            yuv_format: self.yuv_format,
+            yuv_range: self.yuv_range,
+            chroma_sample_position: self.chroma_sample_position,
+            alpha_present: self.alpha_present,
+            alpha_premultiplied: self.alpha_premultiplied,
+            color_primaries: self.color_primaries,
+            transfer_characteristics: self.transfer_characteristics,
+            matrix_coefficients: self.matrix_coefficients,
+            clli: self.clli,
+            pasp: self.pasp,
+            clap: self.clap,
+            irot_angle: self.irot_angle,
+            imir_axis: self.imir_axis,
+            exif: self.exif.clone(),
+            icc: self.icc.clone(),
+            xmp: self.xmp.clone(),
+            image_sequence_track_present: self.image_sequence_track_present,
+            progressive_state: self.progressive_state,
+            ..Default::default()
+        }
+    }
+
     pub(crate) fn depth_valid(&self) -> bool {
         matches!(self.depth, 8 | 10 | 12 | 16)
     }
@@ -148,6 +173,20 @@ impl Image {
 
     pub(crate) fn has_same_properties(&self, other: &Image) -> bool {
         self.width == other.width && self.height == other.height && self.depth == other.depth
+    }
+
+    fn has_same_cicp(&self, other: &Image) -> bool {
+        self.depth == other.depth
+            && self.yuv_format == other.yuv_format
+            && self.yuv_range == other.yuv_range
+            && self.chroma_sample_position == other.chroma_sample_position
+            && self.color_primaries == other.color_primaries
+            && self.transfer_characteristics == other.transfer_characteristics
+            && self.matrix_coefficients == other.matrix_coefficients
+    }
+
+    pub(crate) fn has_same_properties_and_cicp(&self, other: &Image) -> bool {
+        self.has_same_properties(other) && self.has_same_cicp(other)
     }
 
     pub fn width(&self, plane: Plane) -> usize {
@@ -296,16 +335,20 @@ impl Image {
         self.allocate_planes_with_default_values(category, [0, 0, 0, self.max_channel()])
     }
 
-    pub(crate) fn copy_properties_from(&mut self, tile: &Tile) {
-        self.yuv_format = tile.image.yuv_format;
-        self.depth = tile.image.depth;
-        if cfg!(feature = "heic") && tile.codec_config.is_heic() {
+    pub(crate) fn copy_properties_from(
+        &mut self,
+        image: &Image,
+        codec_config: &CodecConfiguration,
+    ) {
+        self.yuv_format = image.yuv_format;
+        self.depth = image.depth;
+        if cfg!(feature = "heic") && codec_config.is_heic() {
             // For AVIF, the information in the `colr` box takes precedence over what is reported
             // by the decoder. For HEIC, we always honor what is reported by the decoder.
-            self.yuv_range = tile.image.yuv_range;
-            self.color_primaries = tile.image.color_primaries;
-            self.transfer_characteristics = tile.image.transfer_characteristics;
-            self.matrix_coefficients = tile.image.matrix_coefficients;
+            self.yuv_range = image.yuv_range;
+            self.color_primaries = image.color_primaries;
+            self.transfer_characteristics = image.transfer_characteristics;
+            self.matrix_coefficients = image.matrix_coefficients;
         }
     }
 
@@ -330,13 +373,13 @@ impl Image {
     pub(crate) fn copy_from_tile(
         &mut self,
         tile: &Image,
-        tile_info: &TileInfo,
+        grid: &Grid,
         tile_index: u32,
         category: Category,
     ) -> AvifResult<()> {
         // This function is used only when |tile| contains pointers and self contains buffers.
-        let row_index = tile_index / tile_info.grid.columns;
-        let column_index = tile_index % tile_info.grid.columns;
+        let row_index = tile_index / grid.columns;
+        let column_index = tile_index % grid.columns;
         for plane in category.planes() {
             let plane = *plane;
             let src_plane = tile.plane_data(plane);
@@ -345,7 +388,7 @@ impl Image {
             }
             let src_plane = src_plane.unwrap();
             // If this is the last tile column, clamp to left over width.
-            let src_width_to_copy = if column_index == tile_info.grid.columns - 1 {
+            let src_width_to_copy = if column_index == grid.columns - 1 {
                 let width_so_far = checked_mul!(src_plane.width, column_index)?;
                 checked_sub!(self.width(plane), usize_from_u32(width_so_far)?)?
             } else {
@@ -353,7 +396,7 @@ impl Image {
             };
 
             // If this is the last tile row, clamp to left over height.
-            let src_height_to_copy = if row_index == tile_info.grid.rows - 1 {
+            let src_height_to_copy = if row_index == grid.rows - 1 {
                 let height_so_far = checked_mul!(src_plane.height, row_index)?;
                 checked_sub!(u32_from_usize(self.height(plane))?, height_so_far)?
             } else {
