@@ -17,23 +17,11 @@ pub mod pixels;
 pub mod stream;
 
 use crate::parser::mp4box::*;
+use crate::utils::*;
 use crate::*;
 
 use std::num::NonZero;
 use std::ops::Range;
-
-// Some HEIF fractional fields can be negative, hence Fraction and UFraction.
-// The denominator is always unsigned.
-
-/// cbindgen:field-names=[n,d]
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C)]
-pub struct Fraction(pub i32, pub u32);
-
-/// cbindgen:field-names=[n,d]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-#[repr(C)]
-pub struct UFraction(pub u32, pub u32);
 
 // 'clap' fractions do not follow this pattern: both numerators and denominators
 // are used as i32, but they are signalled as u32 according to the specification
@@ -293,6 +281,70 @@ pub(crate) fn assert_eq_f32_array(a: &[f32], b: &[f32]) {
 pub(crate) fn check_slice_range(len: usize, range: &Range<usize>) -> AvifResult<()> {
     if range.start >= len || range.end > len {
         return Err(AvifError::NoContent);
+    }
+    Ok(())
+}
+
+pub(crate) fn is_auxiliary_type_alpha(aux_type: &str) -> bool {
+    aux_type == "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha"
+        || aux_type == "urn:mpeg:hevc:2015:auxid:1"
+}
+
+pub(crate) fn validate_grid_image_dimensions(image: &Image, grid: &Grid) -> AvifResult<()> {
+    if checked_mul!(image.width, grid.columns)? < grid.width
+        || checked_mul!(image.height, grid.rows)? < grid.height
+    {
+        return Err(AvifError::InvalidImageGrid(
+                        "Grid image tiles do not completely cover the image (HEIF (ISO/IEC 23008-12:2017), Section 6.6.2.3.1)".into(),
+                    ));
+    }
+    if checked_mul!(image.width, grid.columns)? < grid.width
+        || checked_mul!(image.height, grid.rows)? < grid.height
+    {
+        return Err(AvifError::InvalidImageGrid(
+            "Grid image tiles do not completely cover the image (HEIF (ISO/IEC 23008-12:2017), \
+                    Section 6.6.2.3.1)"
+                .into(),
+        ));
+    }
+    if checked_mul!(image.width, grid.columns - 1)? >= grid.width
+        || checked_mul!(image.height, grid.rows - 1)? >= grid.height
+    {
+        return Err(AvifError::InvalidImageGrid(
+            "Grid image tiles in the rightmost column and bottommost row do not overlap the \
+                     reconstructed image grid canvas. See MIAF (ISO/IEC 23000-22:2019), Section \
+                     7.3.11.4.2, Figure 2"
+                .into(),
+        ));
+    }
+    // ISO/IEC 23000-22:2019, Section 7.3.11.4.2:
+    //   - the tile_width shall be greater than or equal to 64, and should be a multiple of 64
+    //   - the tile_height shall be greater than or equal to 64, and should be a multiple of 64
+    // The "should" part is ignored here.
+    if image.width < 64 || image.height < 64 {
+        return Err(AvifError::InvalidImageGrid(format!(
+            "Grid image tile width ({}) or height ({}) cannot be smaller than 64. See MIAF \
+                     (ISO/IEC 23000-22:2019), Section 7.3.11.4.2",
+            image.width, image.height
+        )));
+    }
+    // ISO/IEC 23000-22:2019, Section 7.3.11.4.2:
+    //   - when the images are in the 4:2:2 chroma sampling format the horizontal tile offsets
+    //     and widths, and the output width, shall be even numbers;
+    //   - when the images are in the 4:2:0 chroma sampling format both the horizontal and
+    //     vertical tile offsets and widths, and the output width and height, shall be even
+    //     numbers.
+    if ((image.yuv_format == PixelFormat::Yuv420 || image.yuv_format == PixelFormat::Yuv422)
+        && (grid.width % 2 != 0 || image.width % 2 != 0))
+        || (image.yuv_format == PixelFormat::Yuv420
+            && (grid.height % 2 != 0 || image.height % 2 != 0))
+    {
+        return Err(AvifError::InvalidImageGrid(format!(
+            "Grid image width ({}) or height ({}) or tile width ({}) or height ({}) shall be \
+                    even if chroma is subsampled in that dimension. See MIAF \
+                    (ISO/IEC 23000-22:2019), Section 7.3.11.4.2",
+            grid.width, grid.height, image.width, image.height
+        )));
     }
     Ok(())
 }
