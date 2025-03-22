@@ -14,7 +14,8 @@
 
 use crate::codecs::Decoder;
 use crate::codecs::DecoderConfig;
-use crate::decoder::Category;
+use crate::decoder::CodecChoice;
+use crate::decoder::GridImageHelper;
 use crate::image::Image;
 use crate::image::YuvRange;
 use crate::internal_utils::pixels::*;
@@ -24,10 +25,11 @@ use dav1d_sys::bindings::*;
 
 use std::mem::MaybeUninit;
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Dav1d {
     context: Option<*mut Dav1dContext>,
     picture: Option<Dav1dPicture>,
+    config: Option<DecoderConfig>,
 }
 
 unsafe extern "C" fn avif_dav1d_free_callback(
@@ -40,19 +42,18 @@ unsafe extern "C" fn avif_dav1d_free_callback(
 // See https://code.videolan.org/videolan/dav1d/-/blob/9849ede1304da1443cfb4a86f197765081034205/include/dav1d/common.h#L55-59
 const DAV1D_EAGAIN: i32 = if libc::EPERM > 0 { -libc::EAGAIN } else { libc::EAGAIN };
 
-// The type of the fields from dav1d_sys::bindings::* are dependent on the
-// compiler that is used to generate the bindings, version of dav1d, etc.
-// So allow clippy to ignore unnecessary cast warnings.
-#[allow(clippy::unnecessary_cast)]
-impl Decoder for Dav1d {
-    fn initialize(&mut self, config: &DecoderConfig) -> AvifResult<()> {
+impl Dav1d {
+    fn initialize_impl(&mut self, low_latency: bool) -> AvifResult<()> {
         if self.context.is_some() {
             return Ok(());
         }
+        let config = self.config.unwrap_ref();
         let mut settings_uninit: MaybeUninit<Dav1dSettings> = MaybeUninit::uninit();
         unsafe { dav1d_default_settings(settings_uninit.as_mut_ptr()) };
         let mut settings = unsafe { settings_uninit.assume_init() };
-        settings.max_frame_delay = 1;
+        if low_latency {
+            settings.max_frame_delay = 1;
+        }
         settings.n_threads = i32::try_from(config.max_threads).unwrap_or(1);
         settings.operating_point = config.operating_point as i32;
         settings.all_layers = if config.all_layers { 1 } else { 0 };
@@ -78,7 +79,94 @@ impl Decoder for Dav1d {
             )));
         }
         self.context = Some(unsafe { dec.assume_init() });
+        Ok(())
+    }
 
+    fn picture_to_image(
+        &self,
+        dav1d_picture: &Dav1dPicture,
+        image: &mut Image,
+        category: Category,
+    ) -> AvifResult<()> {
+        match category {
+            Category::Alpha => {
+                if image.width > 0
+                    && image.height > 0
+                    && (image.width != (dav1d_picture.p.w as u32)
+                        || image.height != (dav1d_picture.p.h as u32)
+                        || image.depth != (dav1d_picture.p.bpc as u8))
+                {
+                    // Alpha plane does not match the previous alpha plane.
+                    return Err(AvifError::UnknownError("".into()));
+                }
+                image.width = dav1d_picture.p.w as u32;
+                image.height = dav1d_picture.p.h as u32;
+                image.depth = dav1d_picture.p.bpc as u8;
+                image.row_bytes[3] = dav1d_picture.stride[0] as u32;
+                image.planes[3] = Some(Pixels::from_raw_pointer(
+                    dav1d_picture.data[0] as *mut u8,
+                    image.depth as u32,
+                    image.height,
+                    image.row_bytes[3],
+                )?);
+                image.image_owns_planes[3] = false;
+                let seq_hdr = unsafe { &(*dav1d_picture.seq_hdr) };
+                image.yuv_range =
+                    if seq_hdr.color_range == 0 { YuvRange::Limited } else { YuvRange::Full };
+            }
+            _ => {
+                image.width = dav1d_picture.p.w as u32;
+                image.height = dav1d_picture.p.h as u32;
+                image.depth = dav1d_picture.p.bpc as u8;
+
+                image.yuv_format = match dav1d_picture.p.layout {
+                    0 => PixelFormat::Yuv400,
+                    1 => PixelFormat::Yuv420,
+                    2 => PixelFormat::Yuv422,
+                    3 => PixelFormat::Yuv444,
+                    _ => return Err(AvifError::UnknownError("".into())), // not reached.
+                };
+                let seq_hdr = unsafe { &(*dav1d_picture.seq_hdr) };
+                image.yuv_range =
+                    if seq_hdr.color_range == 0 { YuvRange::Limited } else { YuvRange::Full };
+                image.chroma_sample_position = (seq_hdr.chr as u32).into();
+
+                image.color_primaries = (seq_hdr.pri as u16).into();
+                image.transfer_characteristics = (seq_hdr.trc as u16).into();
+                image.matrix_coefficients = (seq_hdr.mtrx as u16).into();
+
+                for plane in 0usize..image.yuv_format.plane_count() {
+                    let stride_index = if plane == 0 { 0 } else { 1 };
+                    image.row_bytes[plane] = dav1d_picture.stride[stride_index] as u32;
+                    image.planes[plane] = Some(Pixels::from_raw_pointer(
+                        dav1d_picture.data[plane] as *mut u8,
+                        image.depth as u32,
+                        image.height,
+                        image.row_bytes[plane],
+                    )?);
+                    image.image_owns_planes[plane] = false;
+                }
+                if image.yuv_format == PixelFormat::Yuv400 {
+                    // Clear left over chroma planes from previous frames.
+                    image.clear_chroma_planes();
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// The type of the fields from dav1d_sys::bindings::* are dependent on the
+// compiler that is used to generate the bindings, version of dav1d, etc.
+// So allow clippy to ignore unnecessary cast warnings.
+#[allow(clippy::unnecessary_cast)]
+impl Decoder for Dav1d {
+    fn codec(&self) -> CodecChoice {
+        CodecChoice::Dav1d
+    }
+
+    fn initialize(&mut self, config: &DecoderConfig) -> AvifResult<()> {
+        self.config = Some(config.clone());
         Ok(())
     }
 
@@ -90,7 +178,7 @@ impl Decoder for Dav1d {
         category: Category,
     ) -> AvifResult<()> {
         if self.context.is_none() {
-            self.initialize(&DecoderConfig::default())?;
+            self.initialize_impl(true)?;
         }
         unsafe {
             let mut data: Dav1dData = std::mem::zeroed();
@@ -187,73 +275,17 @@ impl Decoder for Dav1d {
                 return Err(AvifError::UnknownError("".into()));
             }
         }
-
-        let dav1d_picture = self.picture.unwrap_ref();
-        match category {
-            Category::Alpha => {
-                if image.width > 0
-                    && image.height > 0
-                    && (image.width != (dav1d_picture.p.w as u32)
-                        || image.height != (dav1d_picture.p.h as u32)
-                        || image.depth != (dav1d_picture.p.bpc as u8))
-                {
-                    // Alpha plane does not match the previous alpha plane.
-                    return Err(AvifError::UnknownError("".into()));
-                }
-                image.width = dav1d_picture.p.w as u32;
-                image.height = dav1d_picture.p.h as u32;
-                image.depth = dav1d_picture.p.bpc as u8;
-                image.row_bytes[3] = dav1d_picture.stride[0] as u32;
-                image.planes[3] = Some(Pixels::from_raw_pointer(
-                    dav1d_picture.data[0] as *mut u8,
-                    image.depth as u32,
-                    image.height,
-                    image.row_bytes[3],
-                )?);
-                image.image_owns_planes[3] = false;
-                let seq_hdr = unsafe { &(*dav1d_picture.seq_hdr) };
-                image.yuv_range =
-                    if seq_hdr.color_range == 0 { YuvRange::Limited } else { YuvRange::Full };
-            }
-            _ => {
-                image.width = dav1d_picture.p.w as u32;
-                image.height = dav1d_picture.p.h as u32;
-                image.depth = dav1d_picture.p.bpc as u8;
-
-                image.yuv_format = match dav1d_picture.p.layout {
-                    0 => PixelFormat::Yuv400,
-                    1 => PixelFormat::Yuv420,
-                    2 => PixelFormat::Yuv422,
-                    3 => PixelFormat::Yuv444,
-                    _ => return Err(AvifError::UnknownError("".into())), // not reached.
-                };
-                let seq_hdr = unsafe { &(*dav1d_picture.seq_hdr) };
-                image.yuv_range =
-                    if seq_hdr.color_range == 0 { YuvRange::Limited } else { YuvRange::Full };
-                image.chroma_sample_position = (seq_hdr.chr as u32).into();
-
-                image.color_primaries = (seq_hdr.pri as u16).into();
-                image.transfer_characteristics = (seq_hdr.trc as u16).into();
-                image.matrix_coefficients = (seq_hdr.mtrx as u16).into();
-
-                for plane in 0usize..image.yuv_format.plane_count() {
-                    let stride_index = if plane == 0 { 0 } else { 1 };
-                    image.row_bytes[plane] = dav1d_picture.stride[stride_index] as u32;
-                    image.planes[plane] = Some(Pixels::from_raw_pointer(
-                        dav1d_picture.data[plane] as *mut u8,
-                        image.depth as u32,
-                        image.height,
-                        image.row_bytes[plane],
-                    )?);
-                    image.image_owns_planes[plane] = false;
-                }
-                if image.yuv_format == PixelFormat::Yuv400 {
-                    // Clear left over chroma planes from previous frames.
-                    image.clear_chroma_planes();
-                }
-            }
-        }
+        self.picture_to_image(self.picture.unwrap_ref(), image, category)?;
         Ok(())
+    }
+
+    fn get_next_image_grid(
+        &mut self,
+        _payloads: &[Vec<u8>],
+        _spatial_id: u8,
+        _grid_image_helper: &mut GridImageHelper,
+    ) -> AvifResult<()> {
+        Err(AvifError::NotImplemented)
     }
 }
 

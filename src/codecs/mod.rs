@@ -21,11 +21,13 @@ pub mod libgav1;
 #[cfg(feature = "android_mediacodec")]
 pub mod android_mediacodec;
 
-use crate::decoder::Category;
+use crate::decoder::CodecChoice;
+use crate::decoder::GridImageHelper;
 use crate::image::Image;
 use crate::parser::mp4box::CodecConfiguration;
 use crate::AndroidMediaCodecOutputColorFormat;
 use crate::AvifResult;
+use crate::Category;
 
 use std::num::NonZero;
 
@@ -45,13 +47,22 @@ pub struct DecoderConfig {
 }
 
 pub trait Decoder {
+    fn codec(&self) -> CodecChoice;
     fn initialize(&mut self, config: &DecoderConfig) -> AvifResult<()>;
+    // Decode a single image and write the output into |image|.
     fn get_next_image(
         &mut self,
         av1_payload: &[u8],
         spatial_id: u8,
         image: &mut Image,
         category: Category,
+    ) -> AvifResult<()>;
+    // Decode a list of input images and outputs them into the |grid_image_helper|.
+    fn get_next_image_grid(
+        &mut self,
+        payloads: &[Vec<u8>],
+        spatial_id: u8,
+        grid_image_helper: &mut GridImageHelper,
     ) -> AvifResult<()>;
     // Destruction must be implemented using Drop.
 }
