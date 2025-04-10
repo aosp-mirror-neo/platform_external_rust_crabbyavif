@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// The type of the fields from dav1d_sys::bindings::* are dependent on the
+// compiler that is used to generate the bindings, version of dav1d, etc.
+// So allow clippy to ignore unnecessary cast warnings.
+#![allow(clippy::unnecessary_cast)]
+
 use crate::codecs::Decoder;
 use crate::codecs::DecoderConfig;
 use crate::decoder::CodecChoice;
@@ -28,7 +33,7 @@ use std::mem::MaybeUninit;
 #[derive(Default)]
 pub struct Dav1d {
     context: Option<*mut Dav1dContext>,
-    picture: Option<Dav1dPicture>,
+    picture: Option<Dav1dPictureWrapper>,
     config: Option<DecoderConfig>,
 }
 
@@ -41,6 +46,89 @@ unsafe extern "C" fn avif_dav1d_free_callback(
 
 // See https://code.videolan.org/videolan/dav1d/-/blob/9849ede1304da1443cfb4a86f197765081034205/include/dav1d/common.h#L55-59
 const DAV1D_EAGAIN: i32 = if libc::EPERM > 0 { -libc::EAGAIN } else { libc::EAGAIN };
+
+struct Dav1dPictureWrapper {
+    picture: Dav1dPicture,
+}
+
+impl Default for Dav1dPictureWrapper {
+    fn default() -> Self {
+        Self {
+            picture: unsafe { std::mem::zeroed() },
+        }
+    }
+}
+
+impl Dav1dPictureWrapper {
+    fn mut_ptr(&mut self) -> *mut Dav1dPicture {
+        (&mut self.picture) as *mut _
+    }
+
+    fn get(&self) -> &Dav1dPicture {
+        &self.picture
+    }
+
+    fn use_layer(&self, spatial_id: u8) -> bool {
+        spatial_id == 0xFF || spatial_id == unsafe { (*self.get().frame_hdr).spatial_id as u8 }
+    }
+}
+
+impl Drop for Dav1dPictureWrapper {
+    fn drop(&mut self) {
+        unsafe {
+            dav1d_picture_unref(self.mut_ptr());
+        }
+    }
+}
+
+struct Dav1dDataWrapper {
+    data: Dav1dData,
+}
+
+impl Default for Dav1dDataWrapper {
+    fn default() -> Self {
+        Self {
+            data: unsafe { std::mem::zeroed() },
+        }
+    }
+}
+
+impl Dav1dDataWrapper {
+    fn mut_ptr(&mut self) -> *mut Dav1dData {
+        (&mut self.data) as *mut _
+    }
+
+    fn has_data(&self) -> bool {
+        self.data.sz > 0 && !self.data.data.is_null()
+    }
+
+    fn wrap(&mut self, payload: &[u8]) -> AvifResult<()> {
+        match unsafe {
+            dav1d_data_wrap(
+                self.mut_ptr(),
+                payload.as_ptr(),
+                payload.len(),
+                Some(avif_dav1d_free_callback),
+                /*cookie=*/ std::ptr::null_mut(),
+            )
+        } {
+            0 => Ok(()),
+            res => Err(AvifError::UnknownError(format!(
+                "dav1d_data_wrap returned {res}"
+            ))),
+        }
+    }
+}
+
+impl Drop for Dav1dDataWrapper {
+    fn drop(&mut self) {
+        if self.has_data() {
+            unsafe {
+                dav1d_data_unref(self.mut_ptr());
+            }
+        }
+    }
+}
 
 impl Dav1d {
     fn initialize_impl(&mut self, low_latency: bool) -> AvifResult<()> {
@@ -154,12 +242,26 @@ impl Dav1d {
         }
         Ok(())
     }
+
+    fn flush(&mut self) -> AvifResult<()> {
+        unsafe {
+            loop {
+                let mut picture = Dav1dPictureWrapper::default();
+                let res = dav1d_get_picture(self.context.unwrap(), picture.mut_ptr());
+                if res < 0 && res != DAV1D_EAGAIN {
+                    return Err(AvifError::UnknownError(format!(
+                        "error draining buffered frames {res}"
+                    )));
+                }
+                if res != 0 {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
-// The type of the fields from dav1d_sys::bindings::* are dependent on the
-// compiler that is used to generate the bindings, version of dav1d, etc.
-// So allow clippy to ignore unnecessary cast warnings.
-#[allow(clippy::unnecessary_cast)]
 impl Decoder for Dav1d {
     fn codec(&self) -> CodecChoice {
         CodecChoice::Dav1d
@@ -181,119 +283,100 @@ impl Decoder for Dav1d {
             self.initialize_impl(true)?;
         }
         unsafe {
-            let mut data: Dav1dData = std::mem::zeroed();
-            let res = dav1d_data_wrap(
-                (&mut data) as *mut _,
-                av1_payload.as_ptr(),
-                av1_payload.len(),
-                Some(avif_dav1d_free_callback),
-                /*cookie=*/ std::ptr::null_mut(),
-            );
-            if res != 0 {
-                return Err(AvifError::UnknownError(format!(
-                    "dav1d_data_wrap returned {res}"
-                )));
-            }
-            let mut next_frame: Dav1dPicture = std::mem::zeroed();
-            let got_picture;
+            let mut data = Dav1dDataWrapper::default();
+            data.wrap(av1_payload)?;
+            let next_picture: Option<Dav1dPictureWrapper>;
             loop {
-                if !data.data.is_null() {
-                    let res = dav1d_send_data(self.context.unwrap(), (&mut data) as *mut _);
+                if data.has_data() {
+                    let res = dav1d_send_data(self.context.unwrap(), data.mut_ptr());
                     if res < 0 && res != DAV1D_EAGAIN {
-                        dav1d_data_unref((&mut data) as *mut _);
                         return Err(AvifError::UnknownError(format!(
                             "dav1d_send_data returned {res}"
                         )));
                     }
                 }
 
-                let res = dav1d_get_picture(self.context.unwrap(), (&mut next_frame) as *mut _);
+                let mut picture = Dav1dPictureWrapper::default();
+                let res = dav1d_get_picture(self.context.unwrap(), picture.mut_ptr());
                 if res == DAV1D_EAGAIN {
-                    // send more data.
-                    if !data.data.is_null() {
+                    if data.has_data() {
                         continue;
                     }
                     return Err(AvifError::UnknownError("".into()));
                 } else if res < 0 {
-                    if !data.data.is_null() {
-                        dav1d_data_unref((&mut data) as *mut _);
-                    }
                     return Err(AvifError::UnknownError(format!(
                         "dav1d_send_picture returned {res}"
                     )));
-                } else {
+                } else if picture.use_layer(spatial_id) {
                     // Got a picture.
-                    let frame_spatial_id = (*next_frame.frame_hdr).spatial_id as u8;
-                    if spatial_id != 0xFF && spatial_id != frame_spatial_id {
-                        // layer selection: skip this unwanted layer.
-                        dav1d_picture_unref((&mut next_frame) as *mut _);
-                    } else {
-                        got_picture = true;
-                        break;
-                    }
-                }
-            }
-            if !data.data.is_null() {
-                dav1d_data_unref((&mut data) as *mut _);
-            }
-
-            // Drain all buffered frames in the decoder.
-            //
-            // The sample should have only one frame of the desired layer. If there are more frames
-            // after that frame, we need to discard them so that they won't be mistakenly output
-            // when the decoder is used to decode another sample.
-            let mut buffered_frame: Dav1dPicture = std::mem::zeroed();
-            loop {
-                let res = dav1d_get_picture(self.context.unwrap(), (&mut buffered_frame) as *mut _);
-                if res < 0 {
-                    if res != DAV1D_EAGAIN {
-                        if got_picture {
-                            dav1d_picture_unref((&mut next_frame) as *mut _);
-                        }
-                        return Err(AvifError::UnknownError(format!(
-                            "error draining buffered frames {res}"
-                        )));
-                    }
-                } else {
-                    dav1d_picture_unref((&mut buffered_frame) as *mut _);
-                }
-                if res != 0 {
+                    next_picture = Some(picture);
                     break;
                 }
             }
-
-            if got_picture {
-                // unref previous frame.
-                if self.picture.is_some() {
-                    let mut previous_picture = self.picture.unwrap();
-                    dav1d_picture_unref((&mut previous_picture) as *mut _);
-                }
-                self.picture = Some(next_frame);
+            self.flush()?;
+            if next_picture.is_some() {
+                self.picture = Some(next_picture.unwrap());
             } else if category == Category::Alpha && self.picture.is_some() {
                 // Special case for alpha, re-use last frame.
             } else {
                 return Err(AvifError::UnknownError("".into()));
             }
         }
-        self.picture_to_image(self.picture.unwrap_ref(), image, category)?;
+        self.picture_to_image(self.picture.unwrap_ref().get(), image, category)?;
         Ok(())
     }
 
     fn get_next_image_grid(
         &mut self,
-        _payloads: &[Vec<u8>],
-        _spatial_id: u8,
-        _grid_image_helper: &mut GridImageHelper,
+        payloads: &[Vec<u8>],
+        spatial_id: u8,
+        grid_image_helper: &mut GridImageHelper,
     ) -> AvifResult<()> {
-        Err(AvifError::NotImplemented)
+        if self.context.is_none() {
+            self.initialize_impl(false)?;
+        }
+        let mut res;
+        let context = self.context.unwrap();
+        let mut payloads_iter = payloads.iter().peekable();
+        unsafe {
+            let mut data = Dav1dDataWrapper::default();
+            while !grid_image_helper.is_grid_complete()? {
+                if !data.has_data() && payloads_iter.peek().is_some() {
+                    data.wrap(payloads_iter.next().unwrap())?;
+                }
+                if data.has_data() {
+                    res = dav1d_send_data(context, data.mut_ptr());
+                    if res != 0 && res != DAV1D_EAGAIN {
+                        return Err(AvifError::UnknownError(format!(
+                            "dav1d_send_data returned {res}"
+                        )));
+                    }
+                }
+                let mut picture = Dav1dPictureWrapper::default();
+                res = dav1d_get_picture(context, picture.mut_ptr());
+                if res != 0 && res != DAV1D_EAGAIN {
+                    return Err(AvifError::UnknownError(format!(
+                        "dav1d_get_picture returned {res}"
+                    )));
+                } else if res == 0 && picture.use_layer(spatial_id) {
+                    let mut cell_image = Image::default();
+                    self.picture_to_image(
+                        picture.get(),
+                        &mut cell_image,
+                        grid_image_helper.category,
+                    )?;
+                    grid_image_helper.copy_from_cell_image(&mut cell_image)?;
+                }
+            }
+            self.flush()?;
+        }
+        Ok(())
     }
 }
 
 impl Drop for Dav1d {
     fn drop(&mut self) {
-        if self.picture.is_some() {
-            unsafe { dav1d_picture_unref(self.picture.unwrap_mut() as *mut _) };
-        }
+        self.picture = None;
         if self.context.is_some() {
             unsafe { dav1d_close(&mut self.context.unwrap()) };
         }
