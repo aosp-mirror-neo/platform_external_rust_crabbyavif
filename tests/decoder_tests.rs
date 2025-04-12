@@ -253,6 +253,31 @@ fn color_grid_alpha_no_grid() {
     assert!(alpha_plane.unwrap().row_bytes > 0);
 }
 
+#[test_case::test_case("paris_icc_exif_xmp.avif")]
+#[test_case::test_case("sofa_grid1x5_420.avif")]
+#[test_case::test_case("color_grid_alpha_nogrid.avif")]
+#[test_case::test_case("seine_sdr_gainmap_srgb.avif")]
+fn image_content_to_decode_none(filename: &str) {
+    let mut decoder = get_decoder(filename);
+    decoder.settings.image_content_to_decode = ImageContentType::None;
+    assert!(decoder.parse().is_ok());
+    assert!(decoder.next_image().is_err());
+}
+
+#[test_case::test_case("draw_points_idat.avif")]
+#[test_case::test_case("draw_points_idat_metasize0.avif")]
+#[test_case::test_case("draw_points_idat_progressive.avif")]
+#[test_case::test_case("draw_points_idat_progressive_metasize0.avif")]
+fn idat(filename: &str) {
+    let mut decoder = get_decoder(filename);
+    assert!(decoder.parse().is_ok());
+    if !HAS_DECODER {
+        return;
+    }
+    let res = decoder.next_image();
+    assert_eq!(res, Ok(()));
+}
+
 // From avifprogressivetest.cc
 #[test_case::test_case("progressive_dimension_change.avif", 2, 256, 256; "progressive_dimension_change")]
 #[test_case::test_case("progressive_layered_grid.avif", 2, 512, 256; "progressive_layered_grid")]
@@ -339,6 +364,34 @@ fn decoder_parse_icc_exif_xmp() {
     assert_eq!(image.xmp[1], 63);
     assert_eq!(image.xmp[2], 120);
     assert_eq!(image.xmp[3], 112);
+}
+
+#[test]
+fn decode_gainmap() {
+    let filename = "tmap_primary_item.avif";
+    let mut decoder = get_decoder(filename);
+    let res = decoder.parse();
+    assert!(res.is_ok());
+    // Gain map found but not decoded.
+    assert!(decoder.gainmap_present());
+    assert!(
+        decoder.gainmap().metadata.base_hdr_headroom.0 != 0
+            || decoder.gainmap().metadata.alternate_hdr_headroom.0 != 0
+    );
+    assert_eq!(decoder.gainmap().image.width, 0);
+
+    // Decode again with image_content_to_decode = ImageContentType::All.
+    decoder = get_decoder(filename);
+    decoder.settings.image_content_to_decode = ImageContentType::All;
+    let res = decoder.parse();
+    assert!(res.is_ok());
+    // Gain map found and decoded.
+    assert!(decoder.gainmap_present());
+    assert!(
+        decoder.gainmap().metadata.base_hdr_headroom.0 != 0
+            || decoder.gainmap().metadata.alternate_hdr_headroom.0 != 0
+    );
+    assert_ne!(decoder.gainmap().image.width, 0);
 }
 
 // From avifgainmaptest.cc
@@ -441,30 +494,36 @@ fn gainmap_oriented() {
     assert_eq!(decoder.gainmap().image.imir_axis, None);
 }
 
-// The two test files should produce the same results:
-// One has an unsupported 'version' field, the other an unsupported
-// 'minimum_version' field, but the behavior of these two files is the same.
 // From avifgainmaptest.cc
+// Tests files with gain maps that should be ignored by the decoder for various
+// reasons.
+// File with unsupported version field.
 #[test_case::test_case("unsupported_gainmap_version.avif")]
+// File with unsupported minimum version field.
 #[test_case::test_case("unsupported_gainmap_minimum_version.avif")]
+// Missing 'tmap' brand in ftyp box.
+#[test_case::test_case("seine_sdr_gainmap_notmapbrand.avif")]
+// Gain map not present before the base image in 'altr' box.
+#[test_case::test_case("seine_hdr_gainmap_wrongaltr.avif")]
 fn decode_unsupported_version(filename: &str) {
     // Parse with various settings.
     let mut decoder = get_decoder(filename);
     let res = decoder.parse();
     assert!(res.is_ok());
     assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
-    // Gain map marked as not present because the metadata is not supported.
+    // Gain map marked as not present.
     assert!(!decoder.gainmap_present());
     assert_eq!(decoder.gainmap().image.width, 0);
     assert_eq!(decoder.gainmap().metadata.base_hdr_headroom.0, 0);
     assert_eq!(decoder.gainmap().metadata.alternate_hdr_headroom.0, 0);
 
+    // Decode again with image_content_to_decode = ImageContentType::All.
     decoder = get_decoder(filename);
     decoder.settings.image_content_to_decode = ImageContentType::All;
     let res = decoder.parse();
     assert!(res.is_ok());
     assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
-    // Gainmap not found: its metadata is not supported.
+    // Gain map marked as not present.
     assert!(!decoder.gainmap_present());
     assert_eq!(decoder.gainmap().image.width, 0);
     assert_eq!(decoder.gainmap().metadata.base_hdr_headroom.0, 0);
@@ -601,11 +660,11 @@ fn raw_io() {
     let data =
         std::fs::read(get_test_file("colors-animated-8bpc.avif")).expect("Unable to read file");
     let mut decoder = decoder::Decoder::default();
-    let _ = unsafe {
+    unsafe {
         decoder
             .set_io_raw(data.as_ptr(), data.len())
-            .expect("Failed to set IO")
-    };
+            .expect("Failed to set IO");
+    }
     assert!(decoder.parse().is_ok());
     assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
     assert_eq!(decoder.image_count(), 5);
@@ -678,7 +737,7 @@ fn expected_min_decoded_row_count(
     cell_columns: u32,
     available_size: usize,
     size: usize,
-    grid_cell_offsets: &Vec<usize>,
+    grid_cell_offsets: &[usize],
 ) -> u32 {
     if available_size >= size {
         return height;
@@ -709,7 +768,7 @@ fn expected_min_decoded_row_count_computation() {
         expected_min_decoded_row_count(770, cell_height, 1, 1000, 30000, &grid_cell_offsets)
     );
     assert_eq!(
-        1 * cell_height,
+        cell_height,
         expected_min_decoded_row_count(770, cell_height, 1, 4000, 30000, &grid_cell_offsets)
     );
     assert_eq!(
@@ -721,7 +780,7 @@ fn expected_min_decoded_row_count_computation() {
         expected_min_decoded_row_count(770, cell_height, 1, 17846, 30000, &grid_cell_offsets)
     );
     assert_eq!(
-        1 * cell_height,
+        cell_height,
         expected_min_decoded_row_count(462, cell_height, 2, 17846, 30000, &grid_cell_offsets)
     );
     assert_eq!(
@@ -729,7 +788,7 @@ fn expected_min_decoded_row_count_computation() {
         expected_min_decoded_row_count(462, cell_height, 2, 23000, 30000, &grid_cell_offsets)
     );
     assert_eq!(
-        1 * cell_height,
+        cell_height,
         expected_min_decoded_row_count(308, cell_height, 3, 23000, 30000, &grid_cell_offsets)
     );
     assert_eq!(
@@ -770,8 +829,7 @@ fn incremental_decode() {
         {
             let mut available_size = available_size_rc.borrow_mut();
             if *available_size >= len {
-                println!("parse returned waiting on io after full file.");
-                assert!(false);
+                panic!("parse returned waiting on io after full file.");
             }
             *available_size = std::cmp::min(*available_size + step, len);
         }
@@ -794,8 +852,7 @@ fn incremental_decode() {
         {
             let mut available_size = available_size_rc.borrow_mut();
             if *available_size >= len {
-                println!("next_image returned waiting on io after full file.");
-                assert!(false);
+                panic!("next_image returned waiting on io after full file.");
             }
             let decoded_row_count = decoder.decoded_row_count();
             assert!(decoded_row_count >= previous_decoded_row_count);
@@ -950,6 +1007,21 @@ fn white_1x1_ftyp_size0() -> AvifResult<()> {
         decoder.parse(),
         Err(AvifError::BmffParseFailed(_))
     ));
+    Ok(())
+}
+
+#[test]
+fn white_1x1_unknown_top_level_box_size0() -> AvifResult<()> {
+    // Edit the file to insert an unknown top level box with size 0 after ftyp (invalid).
+    let mut file_bytes = std::fs::read(get_test_file("white_1x1.avif")).unwrap();
+    // Insert a top level box after ftyp (box type and size all 0s).
+    for _ in 0..8 {
+        file_bytes.insert(32, 0);
+    }
+
+    let mut decoder = decoder::Decoder::default();
+    decoder.set_io_vec(file_bytes);
+    assert!(decoder.parse().is_err());
     Ok(())
 }
 
@@ -1163,6 +1235,7 @@ macro_rules! pixel_eq {
     };
 }
 
+#[allow(clippy::zero_prefixed_literal)]
 #[test_case::test_matrix(0usize..4)]
 fn overlay(index: usize) {
     let info = &EXPECTED_OVERLAY_IMAGE_INFOS[index];

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::internal_utils::*;
 use crate::utils::*;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -175,6 +174,7 @@ mod tests {
         invalid!(99, 99, Yuv420, 99, 1, 99, 1, -1i32 as u32, 2, -1i32 as u32, 2),
     ];
 
+    #[allow(clippy::zero_prefixed_literal)]
     #[test_case::test_matrix(0usize..20)]
     fn valid_clap_to_rect(index: usize) {
         let param = &TEST_PARAMS[index];

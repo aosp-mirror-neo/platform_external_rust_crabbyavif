@@ -121,7 +121,9 @@ fn yuv8_to_rgb8_color(
         let uv_j = j >> image.yuv_format.chroma_shift_y();
         let y_row = image.row(Plane::Y, j)?;
         let u_row = image.row(Plane::U, uv_j)?;
-        let v_row = image.row(Plane::V, uv_j)?;
+        // If V plane is missing, then the format is NV12. In that case, set V
+        // as U plane but starting at offset 1.
+        let v_row = image.row(Plane::V, uv_j).unwrap_or(&u_row[1..]);
         let dst = rgb.row_mut(j)?;
         for i in 0..image.width as usize {
             let uv_i = (i >> chroma_shift.0) << chroma_shift.1;
@@ -277,7 +279,9 @@ fn yuv8_to_rgb16_color(
         let uv_j = j >> image.yuv_format.chroma_shift_y();
         let y_row = image.row(Plane::Y, j)?;
         let u_row = image.row(Plane::U, uv_j)?;
-        let v_row = image.row(Plane::V, uv_j)?;
+        // If V plane is missing, then the format is NV12. In that case, set V
+        // as U plane but starting at offset 1.
+        let v_row = image.row(Plane::V, uv_j).unwrap_or(&u_row[1..]);
         let dst = rgb.row16_mut(j)?;
         for i in 0..image.width as usize {
             let uv_i = (i >> chroma_shift.0) << chroma_shift.1;
@@ -759,7 +763,7 @@ mod tests {
                 assert_eq!(dst.width, g[y as usize].len() as u32);
                 assert_eq!(dst.width, b[y as usize].len() as u32);
                 for x in 0..dst.width {
-                    let i = (x * dst.pixel_size() + 0) as usize;
+                    let i = (x * dst.pixel_size()) as usize;
                     let pixel = &dst.row(y).unwrap()[i..i + 3];
                     assert_eq!(pixel[0], r[y as usize][x as usize]);
                     assert_eq!(pixel[1], g[y as usize][x as usize]);

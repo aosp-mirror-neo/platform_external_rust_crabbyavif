@@ -19,6 +19,9 @@
 mod internal_utils;
 
 pub mod decoder;
+#[cfg(feature = "encoder")]
+pub mod encoder;
+pub mod gainmap;
 pub mod image;
 pub mod reformat;
 pub mod utils;
@@ -85,7 +88,7 @@ impl PixelFormat {
     pub fn chroma_shift_x(&self) -> (u32, u32) {
         match self {
             Self::Yuv422 | Self::Yuv420 => (1, 0),
-            Self::AndroidP010 => (1, 1),
+            Self::AndroidP010 | Self::AndroidNv12 => (1, 1),
             _ => (0, 0),
         }
     }
@@ -414,11 +417,22 @@ pub(crate) use checked_mul;
 pub(crate) use checked_sub;
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Grid {
+pub(crate) struct Grid {
     pub rows: u32,
     pub columns: u32,
     pub width: u32,
     pub height: u32,
+}
+
+#[cfg(feature = "encoder")]
+impl Grid {
+    pub(crate) fn is_last_column(&self, index: u32) -> bool {
+        (index + 1) % self.columns == 0
+    }
+
+    pub(crate) fn is_last_row(&self, index: u32) -> bool {
+        index >= (self.columns * (self.rows - 1))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -447,6 +461,16 @@ impl Category {
             Category::Alpha => &A_PLANE,
             _ => &YUV_PLANES,
         }
+    }
+
+    #[cfg(feature = "encoder")]
+    pub(crate) fn infe_name(&self) -> String {
+        match self {
+            Self::Color => "Color",
+            Self::Alpha => "Alpha",
+            Self::Gainmap => "GMap",
+        }
+        .into()
     }
 }
 

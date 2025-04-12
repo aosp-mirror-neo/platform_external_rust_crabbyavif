@@ -12,12 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod gainmap;
 pub mod item;
 pub mod tile;
 pub mod track;
 
-use crate::decoder::gainmap::*;
 use crate::decoder::item::*;
 use crate::decoder::tile::*;
 use crate::decoder::track::*;
@@ -32,6 +30,7 @@ use crate::codecs::libgav1::Libgav1;
 use crate::codecs::android_mediacodec::MediaCodec;
 
 use crate::codecs::DecoderConfig;
+use crate::gainmap::*;
 use crate::image::*;
 use crate::internal_utils::io::*;
 use crate::internal_utils::*;
@@ -64,7 +63,7 @@ impl dyn IO {
 }
 
 pub type GenericIO = Box<dyn IO>;
-pub type Codec = Box<dyn crate::codecs::Decoder>;
+pub(crate) type Codec = Box<dyn crate::codecs::Decoder>;
 
 #[derive(Debug, Default, PartialEq)]
 pub enum CodecChoice {
@@ -317,13 +316,15 @@ pub enum CompressionFormat {
     Heic = 1,
 }
 
-pub struct GridImageHelper<'a> {
+pub(crate) struct GridImageHelper<'a> {
     grid: &'a Grid,
     image: &'a mut Image,
-    pub(crate) category: Category,
+    pub category: Category,
     cell_index: usize,
     codec_config: &'a CodecConfiguration,
     first_cell_image: Option<Image>,
+    tile_width: u32,
+    tile_height: u32,
 }
 
 // These functions are not used in all configurations.
@@ -333,10 +334,14 @@ impl GridImageHelper<'_> {
         Ok(self.cell_index as u32 == checked_mul!(self.grid.rows, self.grid.columns)?)
     }
 
-    pub(crate) fn copy_from_cell_image(&mut self, cell_image: &Image) -> AvifResult<()> {
+    pub(crate) fn copy_from_cell_image(&mut self, cell_image: &mut Image) -> AvifResult<()> {
         if self.is_grid_complete()? {
             return Ok(());
         }
+        if self.category == Category::Alpha && cell_image.yuv_range == YuvRange::Limited {
+            cell_image.alpha_to_full_range()?;
+        }
+        cell_image.scale(self.tile_width, self.tile_height, self.category)?;
         if self.cell_index == 0 {
             validate_grid_image_dimensions(cell_image, self.grid)?;
             if self.category != Category::Alpha {
@@ -483,46 +488,6 @@ impl Decoder {
         self.tile_info[Category::Alpha.usize()].grid = self.tile_info[Category::Color.usize()].grid;
         self.items.insert(alpha_item_id, alpha_item);
         Ok(Some(alpha_item_id))
-    }
-
-    // returns (tone_mapped_image_item_id, gain_map_item_id) if found
-    fn find_tone_mapped_image_item(&self, color_item_id: u32) -> AvifResult<Option<(u32, u32)>> {
-        let tmap_items: Vec<_> = self.items.values().filter(|x| x.is_tmap()).collect();
-        for item in tmap_items {
-            let dimg_items: Vec<_> = self
-                .items
-                .values()
-                .filter(|x| x.dimg_for_id == item.id)
-                .collect();
-            if dimg_items.len() != 2 {
-                return Err(AvifError::InvalidToneMappedImage(
-                    "Expected tmap to have 2 dimg items".into(),
-                ));
-            }
-            let item0 = if dimg_items[0].dimg_index == 0 { dimg_items[0] } else { dimg_items[1] };
-            if item0.id != color_item_id {
-                continue;
-            }
-            let item1 = if dimg_items[0].dimg_index == 0 { dimg_items[1] } else { dimg_items[0] };
-            return Ok(Some((item.id, item1.id)));
-        }
-        Ok(None)
-    }
-
-    // returns (tone_mapped_image_item_id, gain_map_item_id) if found
-    fn find_gainmap_item(&self, color_item_id: u32) -> AvifResult<Option<(u32, u32)>> {
-        if let Some((tonemap_id, gainmap_id)) = self.find_tone_mapped_image_item(color_item_id)? {
-            let gainmap_item = self
-                .items
-                .get(&gainmap_id)
-                .ok_or(AvifError::InvalidToneMappedImage("".into()))?;
-            if gainmap_item.should_skip() {
-                return Err(AvifError::InvalidToneMappedImage("".into()));
-            }
-            Ok(Some((tonemap_id, gainmap_id)))
-        } else {
-            Ok(None)
-        }
     }
 
     fn validate_gainmap_item(&mut self, gainmap_id: u32, tonemap_id: u32) -> AvifResult<()> {
@@ -713,14 +678,12 @@ impl Decoder {
             if dimg_item.dimg_for_id != item_id {
                 continue;
             }
-            if !dimg_item.is_image_codec_item() || dimg_item.has_unsupported_essential_property {
+            if dimg_item.should_skip() {
                 return Err(AvifError::InvalidImageGrid(
                     "invalid input item in dimg".into(),
                 ));
             }
-            if first_codec_config.is_none() {
-                // Adopt the configuration property of the first tile.
-                // validate_properties() makes sure they are all equal.
+            if dimg_item.is_image_codec_item() && first_codec_config.is_none() {
                 first_codec_config = Some(
                     dimg_item
                         .codec_config()
@@ -732,40 +695,96 @@ impl Decoder {
             }
             source_item_ids.push(*dimg_item_id);
         }
-        if first_codec_config.is_none() {
-            // No derived images were found.
+        if source_item_ids.is_empty() {
             return Ok(());
         }
         // The order of derived item ids matters: sort them by dimg_index, which is the order that
         // items appear in the 'iref' box.
         source_item_ids.sort_by_key(|k| self.items.get(k).unwrap().dimg_index);
         let item = self.items.get_mut(&item_id).unwrap();
-        item.properties.push(ItemProperty::CodecConfiguration(
-            first_codec_config.unwrap(),
-        ));
         item.source_item_ids = source_item_ids;
+        if let Some(first_codec_config) = first_codec_config {
+            // Adopt the configuration property of the first tile.
+            // validate_properties() later makes sure they are all equal.
+            item.properties
+                .push(ItemProperty::CodecConfiguration(first_codec_config));
+        }
         Ok(())
     }
 
-    fn validate_source_item_counts(&self, item_id: u32, tile_info: &TileInfo) -> AvifResult<()> {
+    fn validate_source_items(&self, item_id: u32, tile_info: &TileInfo) -> AvifResult<()> {
         let item = self.items.get(&item_id).unwrap();
+        let source_items: Vec<_> = item
+            .source_item_ids
+            .iter()
+            .map(|id| self.items.get(id).unwrap())
+            .collect();
         if item.is_grid_item() {
             let tile_count = tile_info.grid_tile_count()? as usize;
-            if item.source_item_ids.len() != tile_count {
+            if source_items.len() != tile_count {
                 return Err(AvifError::InvalidImageGrid(
-                    "Expected number of tiles not found".into(),
+                    "expected number of tiles not found".into(),
                 ));
             }
-        } else if item.is_overlay_item() && item.source_item_ids.is_empty() {
-            return Err(AvifError::BmffParseFailed(
-                "No dimg items found for iovl".into(),
-            ));
-        } else if item.is_tmap() && item.source_item_ids.len() != 2 {
-            return Err(AvifError::InvalidToneMappedImage(
-                "Expected tmap to have 2 dimg items".into(),
-            ));
+            if !source_items.iter().all(|item| item.is_image_codec_item()) {
+                return Err(AvifError::InvalidImageGrid("invalid grid items".into()));
+            }
+        } else if item.is_overlay_item() {
+            if source_items.is_empty() {
+                return Err(AvifError::BmffParseFailed(
+                    "no dimg items found for iovl".into(),
+                ));
+            }
+            // MIAF allows overlays of grid but we don't support them.
+            // See ISO/IEC 23000-12:2025, section 7.3.11.1.
+            if source_items.iter().any(|item| item.is_grid_item()) {
+                return Err(AvifError::NotImplemented);
+            }
+            if !source_items.iter().all(|item| item.is_image_codec_item()) {
+                return Err(AvifError::InvalidImageGrid("invalid overlay items".into()));
+            }
+        } else if item.is_tone_mapped_item() {
+            if source_items.len() != 2 {
+                return Err(AvifError::InvalidToneMappedImage(
+                    "expected tmap to have 2 dimg items".into(),
+                ));
+            }
+            if !source_items
+                .iter()
+                .all(|item| item.is_image_codec_item() || item.is_grid_item())
+            {
+                return Err(AvifError::InvalidImageGrid("invalid tmap items".into()));
+            }
         }
         Ok(())
+    }
+
+    fn find_primary_item_id(&self, ftyp: &FileTypeBox, meta: &MetaBox) -> AvifResult<u32> {
+        let primary_item_altr_group = meta
+            .grpl
+            .iter()
+            .find(|g| g.grouping_type == "altr" && g.entity_ids.contains(&meta.primary_item_id));
+        if let Some(altr_group) = primary_item_altr_group {
+            altr_group
+                .entity_ids
+                .iter()
+                .find(|id| match self.items.get(id) {
+                    Some(item) => {
+                        !item.should_skip()
+                            && item.is_image_item()
+                            && (ftyp.has_tmap() || !item.is_tone_mapped_item())
+                    }
+                    None => false,
+                })
+                .cloned()
+                .ok_or(AvifError::NoContent)
+        } else {
+            self.items
+                .iter()
+                .find(|x| !x.1.should_skip() && x.1.id != 0 && x.1.id == meta.primary_item_id)
+                .map(|it| *it.0)
+                .ok_or(AvifError::NoContent)
+        }
     }
 
     fn reset(&mut self) {
@@ -918,18 +937,38 @@ impl Decoder {
                 let mut item_ids: [u32; Category::COUNT] = [0; Category::COUNT];
 
                 // Mandatory color item (primary item).
-                let color_item_id = self
-                    .items
-                    .iter()
-                    .find(|x| {
-                        !x.1.should_skip()
-                            && x.1.id != 0
-                            && x.1.id == avif_boxes.meta.primary_item_id
-                    })
-                    .map(|it| *it.0);
+                let primary_item_id =
+                    self.find_primary_item_id(&avif_boxes.ftyp, &avif_boxes.meta)?;
 
-                item_ids[Category::Color.usize()] = color_item_id.ok_or(AvifError::NoContent)?;
+                item_ids[Category::Color.usize()] = primary_item_id;
                 self.read_and_parse_item(item_ids[Category::Color.usize()], Category::Color)?;
+
+                let primary_item = self.items.get(&primary_item_id).unwrap();
+                if primary_item.is_tone_mapped_item() {
+                    // validate_source_items() guarantees that tmap has two source item ids.
+                    let base_item_id = primary_item.source_item_ids[0];
+                    let gainmap_id = primary_item.source_item_ids[1];
+
+                    // Set the color item it to the base image and reparse it.
+                    item_ids[Category::Color.usize()] = base_item_id;
+                    self.read_and_parse_item(base_item_id, Category::Color)?;
+
+                    // Parse the gainmap making sure its valid.
+                    self.read_and_parse_item(gainmap_id, Category::Gainmap)?;
+
+                    let gainmap_metadata = self.tile_info[Category::Color.usize()]
+                        .gainmap_metadata
+                        .clone();
+                    if let Some(metadata) = gainmap_metadata {
+                        self.validate_gainmap_item(gainmap_id, primary_item_id)?;
+                        self.gainmap.metadata = metadata;
+                        self.gainmap_present = true;
+
+                        if self.settings.image_content_to_decode.gainmap() {
+                            item_ids[Category::Gainmap.usize()] = gainmap_id;
+                        }
+                    }
+                }
 
                 // Find exif/xmp from meta if any.
                 Self::search_exif_or_xmp_metadata(
@@ -948,28 +987,6 @@ impl Decoder {
                         self.read_and_parse_item(alpha_item_id, Category::Alpha)?;
                     }
                     item_ids[Category::Alpha.usize()] = alpha_item_id;
-                }
-
-                // Optional gainmap item
-                if avif_boxes.ftyp.has_tmap() {
-                    if let Some((tonemap_id, gainmap_id)) =
-                        self.find_gainmap_item(item_ids[Category::Color.usize()])?
-                    {
-                        self.validate_gainmap_item(gainmap_id, tonemap_id)?;
-                        self.read_and_parse_item(gainmap_id, Category::Gainmap)?;
-                        let tonemap_item = self
-                            .items
-                            .get_mut(&tonemap_id)
-                            .ok_or(AvifError::InvalidToneMappedImage("".into()))?;
-                        let mut stream = tonemap_item.stream(self.io.unwrap_mut())?;
-                        if let Some(metadata) = mp4box::parse_tmap(&mut stream)? {
-                            self.gainmap.metadata = metadata;
-                            self.gainmap_present = true;
-                            if self.settings.image_content_to_decode.gainmap() {
-                                item_ids[Category::Gainmap.usize()] = gainmap_id;
-                            }
-                        }
-                    }
                 }
 
                 self.image_index = -1;
@@ -1154,10 +1171,11 @@ impl Decoder {
             self.io.unwrap_mut(),
             &mut self.tile_info[category.usize()].grid,
             &mut self.tile_info[category.usize()].overlay,
+            &mut self.tile_info[category.usize()].gainmap_metadata,
             self.settings.image_size_limit,
             self.settings.image_dimension_limit,
         )?;
-        self.validate_source_item_counts(item_id, &self.tile_info[category.usize()])
+        self.validate_source_items(item_id, &self.tile_info[category.usize()])
     }
 
     fn can_use_single_codec(&self) -> AvifResult<bool> {
@@ -1285,7 +1303,9 @@ impl Decoder {
             .get_mut(&sample.item_id)
             .ok_or(AvifError::BmffParseFailed("".into()))?;
         if item.extents.len() == 1 {
-            // Item has only one extent. Nothing to prepare.
+            if !item.idat.is_empty() {
+                item.data_buffer = Some(item.idat.clone());
+            }
             return Ok(());
         }
         if let Some(data) = &item.data_buffer {
@@ -1307,8 +1327,16 @@ impl Decoder {
                 checked_decr!(bytes_to_skip, extent.size);
                 continue;
             }
-            let io = self.io.unwrap_mut();
-            data.extend_from_slice(io.read_exact(extent.offset, extent.size)?);
+            if item.idat.is_empty() {
+                let io = self.io.unwrap_mut();
+                data.extend_from_slice(io.read_exact(extent.offset, extent.size)?);
+            } else {
+                let offset = usize_from_u64(extent.offset)?;
+                let end_offset = checked_add!(offset, extent.size)?;
+                let range = offset..end_offset;
+                check_slice_range(item.idat.len(), &range)?;
+                data.extend_from_slice(&item.idat[range]);
+            }
             if max_num_bytes.is_some_and(|max_num_bytes| data.len() >= max_num_bytes) {
                 return Ok(()); // There are enough merged extents to satisfy max_num_bytes.
             }
@@ -1557,6 +1585,8 @@ impl Decoder {
             cell_index: 0,
             codec_config: &first_tile.codec_config,
             first_cell_image: None,
+            tile_width: first_tile.width,
+            tile_height: first_tile.height,
         };
         let codec = &mut self.codecs[first_tile.codec_index];
         let next_image_result = codec.get_next_image_grid(
@@ -1588,6 +1618,21 @@ impl Decoder {
         Ok(())
     }
 
+    fn can_use_decode_grid(&self, category: Category) -> bool {
+        let first_tile = &self.tiles[category.usize()][0];
+        let codec = self.codecs[first_tile.codec_index].codec();
+        // Has to be a grid.
+        self.tile_info[category.usize()].is_grid()
+            // Has to be one of the supported codecs.
+            && matches!(codec, CodecChoice::MediaCodec | CodecChoice::Dav1d)
+            // Incremental decoding is not supported by decode_grid.
+            && !self.settings.allow_incremental
+            // All the tiles must use the same codec instance.
+            && self.tiles[category.usize()][1..]
+                .iter()
+                .all(|x| x.codec_index == first_tile.codec_index)
+    }
+
     fn decode_tiles(&mut self, image_index: usize) -> AvifResult<()> {
         let mut decoded_something = false;
         for category in self.settings.image_content_to_decode.categories() {
@@ -1595,12 +1640,7 @@ impl Decoder {
             if tile_count == 0 {
                 continue;
             }
-            let first_tile = &self.tiles[category.usize()][0];
-            let codec = self.codecs[first_tile.codec_index].codec();
-            if codec == CodecChoice::MediaCodec
-                && !self.settings.allow_incremental
-                && self.tile_info[category.usize()].is_grid()
-            {
+            if self.can_use_decode_grid(category) {
                 self.decode_grid(image_index, category)?;
                 decoded_something = true;
             } else {

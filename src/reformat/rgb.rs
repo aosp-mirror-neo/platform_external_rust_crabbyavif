@@ -338,11 +338,7 @@ impl Image {
                 }
             }
         }
-        if matches!(
-            image.yuv_format,
-            PixelFormat::AndroidNv12 | PixelFormat::AndroidNv21
-        ) | matches!(self.format, Format::Rgba1010102)
-        {
+        if image.yuv_format == PixelFormat::AndroidNv21 || self.format == Format::Rgba1010102 {
             // These conversions are only supported via libyuv.
             if converted_with_libyuv {
                 if image.has_alpha() && matches!(self.format, Format::Rgba1010102) {
@@ -564,6 +560,7 @@ mod tests {
         },
     ];
 
+    #[allow(clippy::zero_prefixed_literal)]
     #[test_matrix(0usize..5)]
     fn rgb_conversion(rgb_param_index: usize) -> AvifResult<()> {
         let rgb_params = &RGB_PARAMS[rgb_param_index];
@@ -609,7 +606,7 @@ mod tests {
 
         for y in 0..rgb.height as usize {
             let row16 = rgb.row16(y as u32)?;
-            assert_eq!(&row16[..], rgb_params.expected_rgba[y]);
+            assert_eq!(row16, rgb_params.expected_rgba[y]);
         }
         Ok(())
     }
