@@ -175,7 +175,9 @@ impl Image {
         self.width == other.width && self.height == other.height && self.depth == other.depth
     }
 
-    fn has_same_cicp(&self, other: &Image) -> bool {
+    // TODO: b/392112497 - remove this annotation once encoder feature is enabled by default.
+    #[allow(unused)]
+    pub(crate) fn has_same_cicp(&self, other: &Image) -> bool {
         self.depth == other.depth
             && self.yuv_format == other.yuv_format
             && self.yuv_range == other.yuv_range
@@ -185,7 +187,7 @@ impl Image {
             && self.matrix_coefficients == other.matrix_coefficients
     }
 
-    pub(crate) fn has_same_properties_and_cicp(&self, other: &Image) -> bool {
+    pub fn has_same_properties_and_cicp(&self, other: &Image) -> bool {
         self.has_same_properties(other) && self.has_same_cicp(other)
     }
 
@@ -197,12 +199,12 @@ impl Image {
                 | PixelFormat::AndroidP010
                 | PixelFormat::AndroidNv12
                 | PixelFormat::AndroidNv21 => self.width as usize,
-                PixelFormat::Yuv420 | PixelFormat::Yuv422 => (self.width as usize + 1) / 2,
+                PixelFormat::Yuv420 | PixelFormat::Yuv422 => (self.width as usize).div_ceil(2),
                 PixelFormat::None | PixelFormat::Yuv400 => 0,
             },
             Plane::V => match self.yuv_format {
                 PixelFormat::Yuv444 => self.width as usize,
-                PixelFormat::Yuv420 | PixelFormat::Yuv422 => (self.width as usize + 1) / 2,
+                PixelFormat::Yuv420 | PixelFormat::Yuv422 => (self.width as usize).div_ceil(2),
                 PixelFormat::None
                 | PixelFormat::Yuv400
                 | PixelFormat::AndroidP010
@@ -220,12 +222,12 @@ impl Image {
                 PixelFormat::Yuv420
                 | PixelFormat::AndroidP010
                 | PixelFormat::AndroidNv12
-                | PixelFormat::AndroidNv21 => (self.height as usize + 1) / 2,
+                | PixelFormat::AndroidNv21 => (self.height as usize).div_ceil(2),
                 PixelFormat::None | PixelFormat::Yuv400 => 0,
             },
             Plane::V => match self.yuv_format {
                 PixelFormat::Yuv444 | PixelFormat::Yuv422 => self.height as usize,
-                PixelFormat::Yuv420 => (self.height as usize + 1) / 2,
+                PixelFormat::Yuv420 => (self.height as usize).div_ceil(2),
                 PixelFormat::None
                 | PixelFormat::Yuv400
                 | PixelFormat::AndroidP010
@@ -331,7 +333,7 @@ impl Image {
         Ok(())
     }
 
-    pub(crate) fn allocate_planes(&mut self, category: Category) -> AvifResult<()> {
+    pub fn allocate_planes(&mut self, category: Category) -> AvifResult<()> {
         self.allocate_planes_with_default_values(category, [0, 0, 0, self.max_channel()])
     }
 
@@ -554,5 +556,28 @@ impl Image {
             (v * max_channel + uv_bias).clamp(0.0, max_channel) as u16,
             ((rgba[3] as f32) / 65535.0 * max_channel).round() as u16,
         ]
+    }
+
+    #[cfg(feature = "encoder")]
+    pub(crate) fn is_opaque(&self) -> bool {
+        if let Some(plane_data) = self.plane_data(Plane::A) {
+            let opaque_value = self.max_channel();
+            if self.depth == 8 {
+                for y in 0..plane_data.height {
+                    let row = &self.row(Plane::A, y).unwrap()[..plane_data.width as usize];
+                    if !row.iter().all(|pixel| *pixel == opaque_value as u8) {
+                        return false;
+                    }
+                }
+            } else {
+                for y in 0..plane_data.height {
+                    let row = &self.row16(Plane::A, y).unwrap()[..plane_data.width as usize];
+                    if !row.iter().all(|pixel| *pixel == opaque_value) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 }
