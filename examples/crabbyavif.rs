@@ -89,6 +89,16 @@ fn clap_parser(s: &str) -> Result<CleanAperture, String> {
     })
 }
 
+fn crop_parser(s: &str) -> Result<CropRect, String> {
+    let values = split_and_check_count!("crop", s, ",", 4, u32);
+    Ok(CropRect {
+        x: values[0],
+        y: values[1],
+        width: values[2],
+        height: values[3],
+    })
+}
+
 fn clli_parser(s: &str) -> Result<ContentLightLevelInformation, String> {
     let values = split_and_check_count!("clli", s, ",", 2, u16);
     Ok(ContentLightLevelInformation {
@@ -192,6 +202,11 @@ struct CommandLineArgs {
     #[arg(long, value_parser = clap_parser)]
     clap: Option<CleanAperture>,
 
+    /// AVIF Encode only: Add clap property (clean aperture) calculated from a crop rectangle. X,
+    /// Y, Width, Height
+    #[arg(long, value_parser = crop_parser)]
+    crop: Option<CropRect>,
+
     /// AVIF Encode only: Add pasp property (aspect ratio). Horizontal spacing, Vertical spacing
     #[arg(long, value_parser = pasp_parser)]
     pasp: Option<PixelAspectRatio>,
@@ -220,6 +235,19 @@ struct CommandLineArgs {
     /// AVIF Encode only: Set frame scaling mode as given fraction
     #[arg(long, value_parser = scaling_mode_parser)]
     scaling_mode: Option<IFraction>,
+
+    /// AVIF Encode only: log2 of number of tile rows
+    #[arg(long, value_parser = value_parser!(i32).range(0..=6))]
+    tilerowslog2: Option<i32>,
+
+    /// AVIF Encode only: log2 of number of tile columns
+    #[arg(long, value_parser = value_parser!(i32).range(0..=6))]
+    tilecolslog2: Option<i32>,
+
+    /// AVIF Encode only: Set tile rows and columns automatically. If specified, tilesrowslog2 and
+    /// tilecolslog2 will be ignored
+    #[arg(long, default_value = "false")]
+    autotiling: bool,
 
     /// Input AVIF file
     #[arg(allow_hyphen_values = false)]
@@ -590,7 +618,17 @@ fn encode(args: &CommandLineArgs) -> AvifResult<()> {
     let mut image = reader.read_frame()?;
     image.irot_angle = args.irot_angle;
     image.imir_axis = args.imir_axis;
-    image.clap = args.clap;
+    if let Some(clap) = args.clap {
+        image.clap = Some(clap);
+    }
+    if let Some(crop) = args.crop {
+        image.clap = Some(CleanAperture::create_from(
+            &crop,
+            image.width,
+            image.height,
+            image.yuv_format,
+        )?);
+    }
     image.pasp = args.pasp;
     image.clli = args.clli;
     if let Some(nclx) = &args.cicp {
@@ -612,6 +650,14 @@ fn encode(args: &CommandLineArgs) -> AvifResult<()> {
         speed: args.speed,
         mutable: MutableSettings {
             quality: args.quality.unwrap_or(DEFAULT_ENCODE_QUALITY) as i32,
+            tiling_mode: if args.autotiling {
+                TilingMode::Auto
+            } else {
+                TilingMode::Manual(
+                    args.tilerowslog2.unwrap_or(0),
+                    args.tilecolslog2.unwrap_or(0),
+                )
+            },
             ..Default::default()
         },
         ..Default::default()

@@ -16,9 +16,9 @@ use super::image::*;
 use super::types::*;
 
 use crate::image::*;
-use crate::internal_utils::pixels::*;
 use crate::internal_utils::*;
 use crate::reformat::rgb;
+use crate::utils::pixels::*;
 use crate::*;
 
 /// cbindgen:rename-all=CamelCase
@@ -51,7 +51,7 @@ impl From<rgb::Image> for avifRGBImage {
             alpha_premultiplied: rgb.premultiply_alpha,
             is_float: rgb.is_float,
             max_threads: rgb.max_threads,
-            pixels: rgb.pixels(),
+            pixels: rgb.pixels_mut(),
             row_bytes: rgb.row_bytes,
         }
     }

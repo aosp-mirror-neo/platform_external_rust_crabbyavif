@@ -395,42 +395,9 @@ pub(crate) fn yuv_to_rgb(image: &image::Image, rgb: &mut rgb::Image) -> AvifResu
     } else {
         FilterMode_kFilterNone
     };
-    let mut plane_u8: [*const u8; 4] = ALL_PLANES
-        .iter()
-        .map(|x| {
-            if image.has_plane(*x) {
-                image.planes[x.as_usize()].unwrap_ref().ptr()
-            } else {
-                std::ptr::null()
-            }
-        })
-        .collect::<Vec<*const u8>>()
-        .try_into()
-        .unwrap();
-    let plane_u16: [*const u16; 4] = ALL_PLANES
-        .iter()
-        .map(|x| {
-            if image.has_plane(*x) {
-                image.planes[x.as_usize()].unwrap_ref().ptr16()
-            } else {
-                std::ptr::null()
-            }
-        })
-        .collect::<Vec<*const u16>>()
-        .try_into()
-        .unwrap();
-    let mut plane_row_bytes: [i32; 4] = ALL_PLANES
-        .iter()
-        .map(|x| {
-            if image.has_plane(*x) {
-                i32_from_u32(image.plane_data(*x).unwrap().row_bytes).unwrap_or_default()
-            } else {
-                0
-            }
-        })
-        .collect::<Vec<i32>>()
-        .try_into()
-        .unwrap();
+    let mut plane_u8 = image.plane_ptrs();
+    let plane_u16 = image.plane16_ptrs();
+    let mut plane_row_bytes = image.plane_row_bytes()?;
     let rgb_row_bytes = i32_from_u32(rgb.row_bytes)?;
     let width = i32_from_u32(image.width)?;
     let height = i32_from_u32(image.height)?;
@@ -445,7 +412,7 @@ pub(crate) fn yuv_to_rgb(image: &image::Image, rgb: &mut rgb::Image) -> AvifResu
                     plane_row_bytes[0] / 2,
                     plane_u16[1],
                     plane_row_bytes[1] / 2,
-                    rgb.pixels(),
+                    rgb.pixels_mut(),
                     rgb_row_bytes,
                     matrix,
                     width,
@@ -455,9 +422,9 @@ pub(crate) fn yuv_to_rgb(image: &image::Image, rgb: &mut rgb::Image) -> AvifResu
                     // It is okay to use the same pointer as source and destination for this
                     // conversion.
                     func2(
-                        rgb.pixels(),
+                        rgb.pixels_mut(),
                         rgb_row_bytes,
-                        rgb.pixels(),
+                        rgb.pixels_mut(),
                         rgb_row_bytes,
                         width,
                         height,
@@ -474,7 +441,7 @@ pub(crate) fn yuv_to_rgb(image: &image::Image, rgb: &mut rgb::Image) -> AvifResu
                     plane_row_bytes[1] / 2,
                     plane_u16[2],
                     plane_row_bytes[2] / 2,
-                    rgb.pixels(),
+                    rgb.pixels_mut(),
                     rgb_row_bytes,
                     matrix,
                     width,
@@ -484,9 +451,9 @@ pub(crate) fn yuv_to_rgb(image: &image::Image, rgb: &mut rgb::Image) -> AvifResu
                     // It is okay to use the same pointer as source and destination for this
                     // conversion.
                     func2(
-                        rgb.pixels(),
+                        rgb.pixels_mut(),
                         rgb_row_bytes,
-                        rgb.pixels(),
+                        rgb.pixels_mut(),
                         rgb_row_bytes,
                         width,
                         height,
@@ -502,7 +469,7 @@ pub(crate) fn yuv_to_rgb(image: &image::Image, rgb: &mut rgb::Image) -> AvifResu
                 plane_row_bytes[u_plane_index] / 2,
                 plane_u16[v_plane_index],
                 plane_row_bytes[v_plane_index] / 2,
-                rgb.pixels(),
+                rgb.pixels_mut(),
                 rgb_row_bytes,
                 matrix,
                 width,
@@ -518,7 +485,7 @@ pub(crate) fn yuv_to_rgb(image: &image::Image, rgb: &mut rgb::Image) -> AvifResu
                 plane_row_bytes[v_plane_index] / 2,
                 plane_u16[3],
                 plane_row_bytes[3] / 2,
-                rgb.pixels(),
+                rgb.pixels_mut(),
                 rgb_row_bytes,
                 matrix,
                 width,
@@ -533,7 +500,7 @@ pub(crate) fn yuv_to_rgb(image: &image::Image, rgb: &mut rgb::Image) -> AvifResu
                 plane_row_bytes[u_plane_index] / 2,
                 plane_u16[v_plane_index],
                 plane_row_bytes[v_plane_index] / 2,
-                rgb.pixels(),
+                rgb.pixels_mut(),
                 rgb_row_bytes,
                 matrix,
                 width,
@@ -548,7 +515,7 @@ pub(crate) fn yuv_to_rgb(image: &image::Image, rgb: &mut rgb::Image) -> AvifResu
                 plane_row_bytes[v_plane_index] / 2,
                 plane_u16[3],
                 plane_row_bytes[3] / 2,
-                rgb.pixels(),
+                rgb.pixels_mut(),
                 rgb_row_bytes,
                 matrix,
                 width,
@@ -570,30 +537,8 @@ pub(crate) fn yuv_to_rgb(image: &image::Image, rgb: &mut rgb::Image) -> AvifResu
         let mut image8 = image::Image::default();
         if image.depth > 8 {
             downshift_to_8bit(image, &mut image8, conversion_function.is_yuva())?;
-            plane_u8 = ALL_PLANES
-                .iter()
-                .map(|x| {
-                    if image8.has_plane(*x) {
-                        image8.planes[x.as_usize()].unwrap_ref().ptr()
-                    } else {
-                        std::ptr::null()
-                    }
-                })
-                .collect::<Vec<*const u8>>()
-                .try_into()
-                .unwrap();
-            plane_row_bytes = ALL_PLANES
-                .iter()
-                .map(|x| {
-                    if image8.has_plane(*x) {
-                        i32_from_u32(image8.plane_data(*x).unwrap().row_bytes).unwrap_or_default()
-                    } else {
-                        0
-                    }
-                })
-                .collect::<Vec<i32>>()
-                .try_into()
-                .unwrap();
+            plane_u8 = image8.plane_ptrs();
+            plane_row_bytes = image8.plane_row_bytes()?;
         }
         result = match conversion_function {
             ConversionFunction::NVToARGBMatrix(func) => func(
@@ -601,7 +546,7 @@ pub(crate) fn yuv_to_rgb(image: &image::Image, rgb: &mut rgb::Image) -> AvifResu
                 plane_row_bytes[0],
                 plane_u8[1],
                 plane_row_bytes[1],
-                rgb.pixels(),
+                rgb.pixels_mut(),
                 rgb_row_bytes,
                 matrix,
                 width,
@@ -610,7 +555,7 @@ pub(crate) fn yuv_to_rgb(image: &image::Image, rgb: &mut rgb::Image) -> AvifResu
             ConversionFunction::YUV400ToRGBMatrix(func) => func(
                 plane_u8[0],
                 plane_row_bytes[0],
-                rgb.pixels(),
+                rgb.pixels_mut(),
                 rgb_row_bytes,
                 matrix,
                 width,
@@ -623,7 +568,7 @@ pub(crate) fn yuv_to_rgb(image: &image::Image, rgb: &mut rgb::Image) -> AvifResu
                 plane_row_bytes[u_plane_index],
                 plane_u8[v_plane_index],
                 plane_row_bytes[v_plane_index],
-                rgb.pixels(),
+                rgb.pixels_mut(),
                 rgb_row_bytes,
                 matrix,
                 width,
@@ -639,7 +584,7 @@ pub(crate) fn yuv_to_rgb(image: &image::Image, rgb: &mut rgb::Image) -> AvifResu
                 plane_row_bytes[v_plane_index],
                 plane_u8[3],
                 plane_row_bytes[3],
-                rgb.pixels(),
+                rgb.pixels_mut(),
                 rgb_row_bytes,
                 matrix,
                 width,
@@ -654,7 +599,7 @@ pub(crate) fn yuv_to_rgb(image: &image::Image, rgb: &mut rgb::Image) -> AvifResu
                 plane_row_bytes[u_plane_index],
                 plane_u8[v_plane_index],
                 plane_row_bytes[v_plane_index],
-                rgb.pixels(),
+                rgb.pixels_mut(),
                 rgb_row_bytes,
                 matrix,
                 width,
@@ -669,7 +614,7 @@ pub(crate) fn yuv_to_rgb(image: &image::Image, rgb: &mut rgb::Image) -> AvifResu
                 plane_row_bytes[v_plane_index],
                 plane_u8[3],
                 plane_row_bytes[3],
-                rgb.pixels(),
+                rgb.pixels_mut(),
                 rgb_row_bytes,
                 matrix,
                 width,
@@ -741,18 +686,18 @@ pub(crate) fn process_alpha(rgb: &mut rgb::Image, multiply: bool) -> AvifResult<
     let result = unsafe {
         if multiply {
             ARGBAttenuate(
-                rgb.pixels(),
+                rgb.pixels_mut(),
                 i32_from_u32(rgb.row_bytes)?,
-                rgb.pixels(),
+                rgb.pixels_mut(),
                 i32_from_u32(rgb.row_bytes)?,
                 i32_from_u32(rgb.width)?,
                 i32_from_u32(rgb.height)?,
             )
         } else {
             ARGBUnattenuate(
-                rgb.pixels(),
+                rgb.pixels_mut(),
                 i32_from_u32(rgb.row_bytes)?,
-                rgb.pixels(),
+                rgb.pixels_mut(),
                 i32_from_u32(rgb.row_bytes)?,
                 i32_from_u32(rgb.width)?,
                 i32_from_u32(rgb.height)?,
@@ -769,9 +714,9 @@ pub(crate) fn process_alpha(rgb: &mut rgb::Image, multiply: bool) -> AvifResult<
 pub(crate) fn convert_to_half_float(rgb: &mut rgb::Image, scale: f32) -> AvifResult<()> {
     let res = unsafe {
         HalfFloatPlane(
-            rgb.pixels() as *const u16,
+            rgb.pixels_mut() as *const u16,
             i32_from_u32(rgb.row_bytes)?,
-            rgb.pixels() as *mut u16,
+            rgb.pixels_mut() as *mut u16,
             i32_from_u32(rgb.row_bytes)?,
             scale,
             i32_from_u32(rgb.width * rgb.channel_count())?,
