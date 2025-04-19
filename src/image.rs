@@ -14,11 +14,11 @@
 
 use crate::decoder::tile::TileInfo;
 use crate::decoder::ProgressiveState;
-use crate::internal_utils::pixels::*;
 use crate::internal_utils::*;
 use crate::parser::mp4box::CodecConfiguration;
 use crate::reformat::coeffs::*;
 use crate::utils::clap::CleanAperture;
+use crate::utils::pixels::*;
 use crate::*;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -290,6 +290,39 @@ impl Image {
         } else {
             PlaneRow::Depth16(self.row16(plane, row)?)
         })
+    }
+
+    #[cfg(feature = "libyuv")]
+    pub(crate) fn plane_ptrs(&self) -> [*const u8; 4] {
+        ALL_PLANES.map(|x| {
+            if self.has_plane(x) {
+                self.planes[x.as_usize()].unwrap_ref().ptr()
+            } else {
+                std::ptr::null()
+            }
+        })
+    }
+
+    #[cfg(feature = "libyuv")]
+    pub(crate) fn plane16_ptrs(&self) -> [*const u16; 4] {
+        ALL_PLANES.map(|x| {
+            if self.has_plane(x) {
+                self.planes[x.as_usize()].unwrap_ref().ptr16()
+            } else {
+                std::ptr::null()
+            }
+        })
+    }
+
+    #[cfg(feature = "libyuv")]
+    pub(crate) fn plane_row_bytes(&self) -> AvifResult<[i32; 4]> {
+        Ok(ALL_PLANES.map(|x| {
+            if self.has_plane(x) {
+                i32_from_u32(self.plane_data(x).unwrap().row_bytes).unwrap()
+            } else {
+                0
+            }
+        }))
     }
 
     #[cfg(any(feature = "dav1d", feature = "libgav1"))]

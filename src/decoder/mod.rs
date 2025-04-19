@@ -321,6 +321,7 @@ pub(crate) struct GridImageHelper<'a> {
     image: &'a mut Image,
     pub category: Category,
     cell_index: usize,
+    expected_cell_count: usize,
     codec_config: &'a CodecConfiguration,
     first_cell_image: Option<Image>,
     tile_width: u32,
@@ -331,7 +332,7 @@ pub(crate) struct GridImageHelper<'a> {
 #[allow(unused)]
 impl GridImageHelper<'_> {
     pub(crate) fn is_grid_complete(&self) -> AvifResult<bool> {
-        Ok(self.cell_index as u32 == checked_mul!(self.grid.rows, self.grid.columns)?)
+        Ok(self.cell_index == self.expected_cell_count)
     }
 
     pub(crate) fn copy_from_cell_image(&mut self, cell_image: &mut Image) -> AvifResult<()> {
@@ -351,7 +352,9 @@ impl GridImageHelper<'_> {
                     .copy_properties_from(cell_image, self.codec_config);
             }
             self.image.allocate_planes(self.category)?;
-        } else if !cell_image.has_same_properties_and_cicp(self.first_cell_image.unwrap_ref()) {
+        } else if self.first_cell_image.is_some()
+            && !cell_image.has_same_properties_and_cicp(self.first_cell_image.unwrap_ref())
+        {
             return Err(AvifError::InvalidImageGrid(
                 "grid image contains mismatched tiles".into(),
             ));
@@ -490,7 +493,12 @@ impl Decoder {
         Ok(Some(alpha_item_id))
     }
 
-    fn validate_gainmap_item(&mut self, gainmap_id: u32, tonemap_id: u32) -> AvifResult<()> {
+    fn validate_gainmap_item(
+        &mut self,
+        gainmap_id: u32,
+        tonemap_id: u32,
+        #[allow(unused)] color_item_id: u32, // This parameter is unused in some configurations.
+    ) -> AvifResult<()> {
         let gainmap_item = self
             .items
             .get(&gainmap_id)
@@ -533,12 +541,29 @@ impl Decoder {
         // HEIC files created by Apple have some of these properties set in the Tonemap item. So do
         // not perform this validation when HEIC is enabled.
         #[cfg(not(feature = "heic"))]
-        if find_property!(tonemap_item.properties, PixelAspectRatio).is_some()
-            || find_property!(tonemap_item.properties, CleanAperture).is_some()
-            || find_property!(tonemap_item.properties, ImageRotation).is_some()
-            || find_property!(tonemap_item.properties, ImageMirror).is_some()
         {
-            return Err(AvifError::InvalidToneMappedImage("".into()));
+            if let Some(ispe) = find_property!(tonemap_item.properties, ImageSpatialExtents) {
+                let color_item = self
+                    .items
+                    .get(&color_item_id)
+                    .ok_or(AvifError::InvalidToneMappedImage("".into()))?;
+                if ispe.width != color_item.width || ispe.height != color_item.height {
+                    return Err(AvifError::InvalidToneMappedImage(
+                        "Box[tmap] ispe property width/height does not match base image".into(),
+                    ));
+                }
+            } else {
+                return Err(AvifError::InvalidToneMappedImage(
+                    "Box[tmap] missing mandatory ispe property".into(),
+                ));
+            }
+            if find_property!(tonemap_item.properties, PixelAspectRatio).is_some()
+                || find_property!(tonemap_item.properties, CleanAperture).is_some()
+                || find_property!(tonemap_item.properties, ImageRotation).is_some()
+                || find_property!(tonemap_item.properties, ImageMirror).is_some()
+            {
+                return Err(AvifError::InvalidToneMappedImage("".into()));
+            }
         }
         Ok(())
     }
@@ -666,6 +691,8 @@ impl Decoder {
 
         let mut source_item_ids: Vec<u32> = vec![];
         let mut first_codec_config: Option<CodecConfiguration> = None;
+        let mut first_icc: Option<Vec<u8>> = None;
+        let mut first_nclx: Option<Nclx> = None;
         // Collect all the dimg items.
         for dimg_item_id in self.items.keys() {
             if *dimg_item_id == item_id {
@@ -683,15 +710,23 @@ impl Decoder {
                     "invalid input item in dimg".into(),
                 ));
             }
-            if dimg_item.is_image_codec_item() && first_codec_config.is_none() {
-                first_codec_config = Some(
-                    dimg_item
-                        .codec_config()
-                        .ok_or(AvifError::BmffParseFailed(
-                            "missing codec config property".into(),
-                        ))?
-                        .clone(),
-                );
+            if dimg_item.is_image_codec_item() {
+                if first_codec_config.is_none() {
+                    first_codec_config = Some(
+                        dimg_item
+                            .codec_config()
+                            .ok_or(AvifError::BmffParseFailed(
+                                "missing codec config property".into(),
+                            ))?
+                            .clone(),
+                    );
+                }
+                if first_icc.is_none() {
+                    first_icc = find_icc(&dimg_item.properties)?.cloned();
+                }
+                if first_nclx.is_none() {
+                    first_nclx = find_nclx(&dimg_item.properties)?.cloned();
+                }
             }
             source_item_ids.push(*dimg_item_id);
         }
@@ -708,6 +743,22 @@ impl Decoder {
             // validate_properties() later makes sure they are all equal.
             item.properties
                 .push(ItemProperty::CodecConfiguration(first_codec_config));
+        }
+        if item.is_grid_item() || item.is_overlay_item() {
+            // For grid and overlay items, adopt the icc color profile and the nclx of the first
+            // tile if it is not explicitly specified for the overall grid.
+            if first_icc.is_some() && find_icc(&item.properties)?.is_none() {
+                item.properties
+                    .push(ItemProperty::ColorInformation(ColorInformation::Icc(
+                        first_icc.unwrap(),
+                    )));
+            }
+            if first_nclx.is_some() && find_nclx(&item.properties)?.is_none() {
+                item.properties
+                    .push(ItemProperty::ColorInformation(ColorInformation::Nclx(
+                        first_nclx.unwrap(),
+                    )));
+            }
         }
         Ok(())
     }
@@ -960,7 +1011,11 @@ impl Decoder {
                         .gainmap_metadata
                         .clone();
                     if let Some(metadata) = gainmap_metadata {
-                        self.validate_gainmap_item(gainmap_id, primary_item_id)?;
+                        self.validate_gainmap_item(
+                            gainmap_id,
+                            primary_item_id,
+                            item_ids[Category::Color.usize()],
+                        )?;
                         self.gainmap.metadata = metadata;
                         self.gainmap_present = true;
 
@@ -1557,6 +1612,7 @@ impl Decoder {
         let previous_decoded_tile_count =
             self.tile_info[category.usize()].decoded_tile_count as usize;
         let mut payloads = vec![];
+        let mut pending_read = false;
         for tile_index in previous_decoded_tile_count..tile_count {
             let tile = &self.tiles[category.usize()][tile_index];
             let sample = &tile.input.samples[image_index];
@@ -1566,11 +1622,31 @@ impl Decoder {
                 &self.items.get(&sample.item_id).unwrap().data_buffer
             };
             let io = &mut self.io.unwrap_mut();
-            let data = sample.data(io, item_data_buffer)?;
+            let data = match sample.data(io, item_data_buffer) {
+                Ok(data) => data,
+                Err(AvifError::WaitingOnIo) => {
+                    if self.settings.allow_incremental {
+                        if payloads.is_empty() {
+                            // No cells have been read. Nothing to decode.
+                            return Err(AvifError::WaitingOnIo);
+                        } else {
+                            // One or more cells have been read. Decode them.
+                            pending_read = true;
+                            break;
+                        }
+                    } else {
+                        return Err(AvifError::WaitingOnIo);
+                    }
+                }
+                Err(err) => return Err(err),
+            };
             payloads.push(data.to_vec());
         }
         let grid = &self.tile_info[category.usize()].grid;
-        if checked_mul!(grid.rows, grid.columns)? != payloads.len() as u32 {
+        // If we are not doing incremental decode, all the cells must have been read.
+        if !self.settings.allow_incremental
+            && checked_mul!(grid.rows, grid.columns)? != payloads.len() as u32
+        {
             return Err(AvifError::InvalidArgument);
         }
         let first_tile = &self.tiles[category.usize()][previous_decoded_tile_count];
@@ -1582,7 +1658,8 @@ impl Decoder {
                 &mut self.image
             },
             category,
-            cell_index: 0,
+            cell_index: previous_decoded_tile_count,
+            expected_cell_count: previous_decoded_tile_count + payloads.len(),
             codec_config: &first_tile.codec_config,
             first_cell_image: None,
             tile_width: first_tile.width,
@@ -1615,7 +1692,11 @@ impl Decoder {
             self.tile_info[category.usize()].decoded_tile_count,
             u32_from_usize(payloads.len())?
         );
-        Ok(())
+        if pending_read {
+            Err(AvifError::WaitingOnIo)
+        } else {
+            Ok(())
+        }
     }
 
     fn can_use_decode_grid(&self, category: Category) -> bool {
@@ -1625,8 +1706,6 @@ impl Decoder {
         self.tile_info[category.usize()].is_grid()
             // Has to be one of the supported codecs.
             && matches!(codec, CodecChoice::MediaCodec | CodecChoice::Dav1d)
-            // Incremental decoding is not supported by decode_grid.
-            && !self.settings.allow_incremental
             // All the tiles must use the same codec instance.
             && self.tiles[category.usize()][1..]
                 .iter()
