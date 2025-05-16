@@ -19,29 +19,29 @@ use crabby_avif::decoder::track::RepetitionCount;
 use crabby_avif::decoder::*;
 #[cfg(feature = "encoder")]
 use crabby_avif::encoder::*;
-use crabby_avif::image::*;
 use crabby_avif::utils::clap::CleanAperture;
 use crabby_avif::utils::clap::CropRect;
 use crabby_avif::utils::IFraction;
 use crabby_avif::utils::UFraction;
 use crabby_avif::*;
 
-mod reader;
-mod writer;
+#[cfg(all(feature = "encoder", feature = "jpeg"))]
+use crabby_avif::utils::reader::jpeg::JpegReader;
+#[cfg(all(feature = "encoder", feature = "png"))]
+use crabby_avif::utils::reader::png::PngReader;
+#[cfg(feature = "encoder")]
+use crabby_avif::utils::reader::y4m::Y4MReader;
+#[cfg(feature = "encoder")]
+use crabby_avif::utils::reader::Config;
+#[cfg(feature = "encoder")]
+use crabby_avif::utils::reader::Reader;
 
-#[cfg(feature = "encoder")]
-use reader::jpeg::JpegReader;
-#[cfg(feature = "encoder")]
-use reader::png::PngReader;
-#[cfg(feature = "encoder")]
-use reader::y4m::Y4MReader;
-#[cfg(feature = "encoder")]
-use reader::Reader;
-
-use writer::jpeg::JpegWriter;
-use writer::png::PngWriter;
-use writer::y4m::Y4MWriter;
-use writer::Writer;
+#[cfg(feature = "jpeg")]
+use crabby_avif::utils::writer::jpeg::JpegWriter;
+#[cfg(feature = "png")]
+use crabby_avif::utils::writer::png::PngWriter;
+use crabby_avif::utils::writer::y4m::Y4MWriter;
+use crabby_avif::utils::writer::Writer;
 
 use std::fs::File;
 #[cfg(feature = "encoder")]
@@ -132,6 +132,16 @@ fn cicp_parser(s: &str) -> Result<Nclx, String> {
 fn scaling_mode_parser(s: &str) -> Result<IFraction, String> {
     let values = split_and_check_count!("scaling_mode", s, "/", 2, i32);
     Ok(IFraction(values[0], values[1]))
+}
+
+fn yuv_format_parser(s: &str) -> Result<PixelFormat, String> {
+    match s {
+        "420" => Ok(PixelFormat::Yuv420),
+        "422" => Ok(PixelFormat::Yuv422),
+        "444" => Ok(PixelFormat::Yuv444),
+        "400" => Ok(PixelFormat::Yuv400),
+        _ => Err(format!("Invalid yuv format: {s}")),
+    }
 }
 
 #[derive(Parser)]
@@ -252,6 +262,11 @@ struct CommandLineArgs {
     /// tilecolslog2 will be ignored
     #[arg(long, default_value = "false")]
     autotiling: bool,
+
+    /// AVIF Encode only: Output format, one of 444, 422, 420 or 400. Ignored for y4m. For all
+    /// other cases, auto defaults to 444.
+    #[arg(long = "yuv", value_parser = yuv_format_parser)]
+    yuv_format: Option<PixelFormat>,
 
     /// Input AVIF file
     #[arg(allow_hyphen_values = false)]
@@ -545,11 +560,12 @@ fn info(args: &CommandLineArgs) -> AvifResult<()> {
     }
 }
 
-fn get_extension(filename: &str) -> &str {
+fn get_extension(filename: &str) -> String {
     std::path::Path::new(filename)
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("")
+        .to_lowercase()
 }
 
 fn decode(args: &CommandLineArgs) -> AvifResult<()> {
@@ -567,14 +583,16 @@ fn decode(args: &CommandLineArgs) -> AvifResult<()> {
     let output_filename = &args.output_file.as_ref().unwrap().as_str();
     let image = decoder.image().unwrap();
     let extension = get_extension(output_filename);
-    let mut writer: Box<dyn Writer> = match extension {
+    let mut writer: Box<dyn Writer> = match extension.as_str() {
         "y4m" | "yuv" => {
             if !image.icc.is_empty() || !image.exif.is_empty() || !image.xmp.is_empty() {
                 println!("Warning: metadata dropped when saving to {extension}");
             }
             Box::new(Y4MWriter::create(extension == "yuv"))
         }
+        #[cfg(feature = "png")]
         "png" => Box::new(PngWriter { depth: args.depth }),
+        #[cfg(feature = "jpeg")]
         "jpg" | "jpeg" => Box::new(JpegWriter {
             quality: args.quality,
         }),
@@ -608,9 +626,11 @@ fn read_file(filepath: &String) -> io::Result<Vec<u8>> {
 fn encode(args: &CommandLineArgs) -> AvifResult<()> {
     const DEFAULT_ENCODE_QUALITY: u8 = 90;
     let extension = get_extension(&args.input_file);
-    let mut reader: Box<dyn Reader> = match extension {
+    let mut reader: Box<dyn Reader> = match extension.as_str() {
         "y4m" => Box::new(Y4MReader::create(&args.input_file)?),
+        #[cfg(feature = "jpeg")]
         "jpg" | "jpeg" => Box::new(JpegReader::create(&args.input_file)?),
+        #[cfg(feature = "png")]
         "png" => Box::new(PngReader::create(&args.input_file)?),
         _ => {
             return Err(AvifError::UnknownError(format!(
@@ -618,7 +638,12 @@ fn encode(args: &CommandLineArgs) -> AvifResult<()> {
             )));
         }
     };
-    let mut image = reader.read_frame()?;
+    let reader_config = Config {
+        yuv_format: args.yuv_format,
+        depth: args.depth,
+        ..Default::default()
+    };
+    let mut image = reader.read_frame(&reader_config)?;
     image.irot_angle = args.irot_angle;
     image.imir_axis = args.imir_axis;
     if let Some(clap) = args.clap {
@@ -683,7 +708,7 @@ fn encode(args: &CommandLineArgs) -> AvifResult<()> {
             if !reader.has_more_frames() {
                 break;
             }
-            image = reader.read_frame()?;
+            image = reader.read_frame(&reader_config)?;
         }
     } else if args.progressive {
         // Encode the base layer with very low quality.
@@ -711,8 +736,21 @@ fn encode(_args: &CommandLineArgs) -> AvifResult<()> {
     Err(AvifError::InvalidArgument)
 }
 
+fn can_decode(filename: &str) -> bool {
+    match get_extension(filename).as_str() {
+        "avif" => true,
+        #[cfg(feature = "heic")]
+        "heic" | "heif" => true,
+        _ => false,
+    }
+}
+
+fn can_encode(filename: &str) -> bool {
+    get_extension(filename) == "avif"
+}
+
 fn validate_args(args: &CommandLineArgs) -> AvifResult<()> {
-    if get_extension(&args.input_file) == "avif" {
+    if can_decode(&args.input_file) {
         if args.info {
             if args.output_file.is_some()
                 || args.quality.is_some()
@@ -752,14 +790,25 @@ fn main() {
         eprintln!("ERROR: {:#?}", err);
         std::process::exit(1);
     }
-    let res = if get_extension(&args.input_file) == "avif" {
+    let res = if can_decode(&args.input_file) {
         if args.info {
             info(&args)
         } else {
             decode(&args)
         }
+    } else if let Some(output_file) = &args.output_file {
+        if can_encode(output_file) {
+            encode(&args)
+        } else {
+            eprintln!("Input/output file extensions not supported");
+            std::process::exit(1);
+        }
     } else {
-        encode(&args)
+        eprintln!(
+            "Input file extension not supported: {}",
+            get_extension(&args.input_file)
+        );
+        std::process::exit(1);
     };
     match res {
         Ok(_) => std::process::exit(0),

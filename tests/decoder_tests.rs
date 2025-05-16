@@ -19,9 +19,8 @@ use crabby_avif::image::*;
 use crabby_avif::reformat::rgb;
 use crabby_avif::*;
 
-#[path = "./mod.rs"]
-mod tests;
-use tests::*;
+mod utils;
+use utils::*;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -324,6 +323,25 @@ fn progressive(filename: &str, layer_count: u32, width: u32, height: u32) {
         assert_eq!(image.width, width);
         assert_eq!(image.height, height);
     }
+}
+
+#[test]
+fn decoder_parse_exif_non_zero_tiff_offset() {
+    let mut decoder = get_decoder("paris_exif_non_zero_tiff_offset.avif");
+
+    let res = decoder.parse();
+    assert!(res.is_ok());
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif);
+    let image = decoder.image().expect("image was none");
+
+    assert_eq!(image.exif.len(), 1129);
+    assert_eq!(image.exif[0], 0);
+    assert_eq!(image.exif[1], 0);
+    assert_eq!(image.exif[2], 0);
+    assert_eq!(image.exif[3], 73);
+    assert_eq!(image.exif[4], 73);
+    assert_eq!(image.exif[5], 42);
+    assert_eq!(image.exif[6], 0);
 }
 
 // From avifmetadatatest.cc
@@ -879,6 +897,89 @@ fn incremental_decode() {
 }
 
 #[test]
+fn progressive_partial_data() -> AvifResult<()> {
+    let data = std::fs::read(get_test_file(
+        "progressive/progressive_dimension_change.avif",
+    ))
+    .expect("Unable to read file");
+    let len = data.len();
+    let available_size_rc = Rc::new(RefCell::new(0usize));
+    let mut decoder = decoder::Decoder::default();
+    decoder.settings.allow_progressive = true;
+    let io = Box::new(CustomIO {
+        available_size_rc: available_size_rc.clone(),
+        data,
+    });
+    decoder.set_io(io);
+
+    // Parse.
+    let mut parse_result = decoder.parse();
+    while parse_result.is_err()
+        && matches!(parse_result.as_ref().err().unwrap(), AvifError::WaitingOnIo)
+    {
+        {
+            let mut available_size = available_size_rc.borrow_mut();
+            if *available_size >= len {
+                panic!("parse returned waiting on io after full file.");
+            }
+            *available_size = std::cmp::min(*available_size + 1, len);
+        }
+        parse_result = decoder.parse();
+    }
+    assert!(parse_result.is_ok());
+    if !HAS_DECODER {
+        return Ok(());
+    }
+
+    assert_eq!(decoder.image_count(), 2);
+    let extent0 = decoder.nth_image_max_extent(0)?;
+    assert_eq!(extent0.offset, 306);
+    assert_eq!(extent0.size, 2250);
+    let extent1 = decoder.nth_image_max_extent(1)?;
+    assert_eq!(extent1.offset, 306);
+    assert_eq!(extent1.size, 3813);
+
+    // Getting the first frame now should fail.
+    assert_eq!(decoder.nth_image(0), Err(AvifError::WaitingOnIo));
+    // Set the available size to 1 byte less than the first frame's extent.
+    *available_size_rc.borrow_mut() = extent0.offset as usize + extent0.size - 1;
+    assert_eq!(decoder.nth_image(0), Err(AvifError::WaitingOnIo));
+    // Set the available size to exactly the first frame's extent.
+    *available_size_rc.borrow_mut() = extent0.offset as usize + extent0.size;
+    assert!(decoder.nth_image(0).is_ok());
+    let image = decoder.image().expect("unable to get image");
+    assert_eq!(image.width, 256);
+    assert_eq!(image.height, 256);
+    assert!(image.has_plane(Plane::Y));
+    assert!(image.has_plane(Plane::U));
+    assert!(image.has_plane(Plane::V));
+    // Set the available size to an offset between the first and second frame's extents.
+    *available_size_rc.borrow_mut() = extent0.offset as usize + extent0.size + 100;
+    assert!(decoder.nth_image(0).is_ok());
+    assert_eq!(decoder.nth_image(1), Err(AvifError::WaitingOnIo));
+    // Set the available size to 1 byte less than the second frame's extent.
+    *available_size_rc.borrow_mut() = extent1.offset as usize + extent1.size - 1;
+    assert!(decoder.nth_image(0).is_ok());
+    assert_eq!(decoder.nth_image(1), Err(AvifError::WaitingOnIo));
+    // Set the available size to 1 byte less than the second frame's extent.
+    *available_size_rc.borrow_mut() = extent1.offset as usize + extent1.size;
+    assert!(decoder.nth_image(1).is_ok());
+    let image = decoder.image().expect("unable to get image");
+    assert_eq!(image.width, 256);
+    assert_eq!(image.height, 256);
+    assert!(image.has_plane(Plane::Y));
+    assert!(image.has_plane(Plane::U));
+    assert!(image.has_plane(Plane::V));
+    // At this point, we should be able to fetch both the frames in any order.
+    assert!(decoder.nth_image(0).is_ok());
+    assert!(decoder.nth_image(1).is_ok());
+    assert!(decoder.nth_image(1).is_ok());
+    assert!(decoder.nth_image(0).is_ok());
+
+    Ok(())
+}
+
+#[test]
 fn nth_image() {
     let mut decoder = get_decoder("colors-animated-8bpc.avif");
     let res = decoder.parse();
@@ -1315,4 +1416,25 @@ fn yuv_range(filename: &str, expected_yuv_range: YuvRange) {
     assert!(res.is_ok());
     let image = decoder.image().expect("image was none");
     assert_eq!(image.yuv_range, expected_yuv_range);
+}
+
+#[test_case("weld_sato_8plus8bit.avif", false)]
+#[test_case("weld_sato_8plus8bit_alpha.avif", true)]
+#[test_case("weld_sato_12plus4bit.avif", false)]
+fn sato_16bit(filename: &str, has_alpha: bool) {
+    let mut decoder = get_decoder(filename);
+    assert!(decoder.parse().is_ok());
+    assert_eq!(has_alpha, decoder.image().unwrap().alpha_present);
+    if !HAS_DECODER {
+        return;
+    }
+    let res = decoder.next_image();
+    assert_eq!(res, Ok(()));
+    assert_eq!(has_alpha, decoder.image().unwrap().has_alpha());
+    if cfg!(feature = "sample_transform") {
+        assert_eq!(16, decoder.image().unwrap().depth);
+        // TODO: compare with reference weld_16bit.png
+    } else {
+        assert!(decoder.image().unwrap().depth < 16);
+    }
 }

@@ -12,25 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused)]
-
-#[allow(unused_imports)]
 use crate::image::*;
 use crate::*;
 
 use std::fs::File;
 use std::io::prelude::*;
 
+use super::Config;
 use super::Reader;
-use std::num::NonZero;
 
 use std::io::BufReader;
 use std::io::Read;
-use std::io::Write;
-use std::path::Path;
 
 #[derive(Debug, Default)]
-pub(crate) struct Y4MReader {
+pub struct Y4MReader {
     width: u32,
     height: u32,
     depth: u8,
@@ -150,7 +145,7 @@ impl Y4MReader {
         Ok(())
     }
 
-    pub(crate) fn create(filename: &str) -> AvifResult<Y4MReader> {
+    pub fn create(filename: &str) -> AvifResult<Y4MReader> {
         let mut reader = BufReader::new(File::open(filename).or(Err(AvifError::UnknownError(
             "error opening input file".into(),
         )))?);
@@ -197,7 +192,7 @@ impl Y4MReader {
 }
 
 impl Reader for Y4MReader {
-    fn read_frame(&mut self) -> AvifResult<Image> {
+    fn read_frame(&mut self, _config: &Config) -> AvifResult<Image> {
         const FRAME_MARKER: &str = "FRAME";
         let mut frame_marker = String::new();
         let bytes_read = self
