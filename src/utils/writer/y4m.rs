@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[allow(unused_imports)]
 use crate::image::*;
 use crate::*;
 
@@ -22,15 +21,14 @@ use std::io::prelude::*;
 use super::Writer;
 
 #[derive(Default)]
-pub(crate) struct Y4MWriter {
+pub struct Y4MWriter {
     header_written: bool,
     write_alpha: bool,
     skip_headers: bool,
 }
 
 impl Y4MWriter {
-    #[allow(unused)]
-    pub(crate) fn create(skip_headers: bool) -> Self {
+    pub fn create(skip_headers: bool) -> Self {
         Self {
             skip_headers,
             ..Default::default()

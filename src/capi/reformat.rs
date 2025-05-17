@@ -90,69 +90,13 @@ impl From<&avifRGBImage> for rgb::Image {
     }
 }
 
-impl From<&avifImage> for image::Image {
-    // Only copies fields necessary for reformatting.
-    fn from(image: &avifImage) -> image::Image {
-        image::Image {
-            width: image.width,
-            height: image.height,
-            depth: image.depth as u8,
-            yuv_format: image.yuvFormat,
-            yuv_range: image.yuvRange,
-            alpha_present: !image.alphaPlane.is_null(),
-            alpha_premultiplied: image.alphaPremultiplied == AVIF_TRUE,
-            planes: [
-                Pixels::from_raw_pointer(
-                    image.yuvPlanes[0],
-                    image.depth,
-                    image.height,
-                    image.yuvRowBytes[0],
-                )
-                .ok(),
-                Pixels::from_raw_pointer(
-                    image.yuvPlanes[1],
-                    image.depth,
-                    image.height,
-                    image.yuvRowBytes[1],
-                )
-                .ok(),
-                Pixels::from_raw_pointer(
-                    image.yuvPlanes[2],
-                    image.depth,
-                    image.height,
-                    image.yuvRowBytes[2],
-                )
-                .ok(),
-                Pixels::from_raw_pointer(
-                    image.alphaPlane,
-                    image.depth,
-                    image.height,
-                    image.alphaRowBytes,
-                )
-                .ok(),
-            ],
-            row_bytes: [
-                image.yuvRowBytes[0],
-                image.yuvRowBytes[1],
-                image.yuvRowBytes[2],
-                image.alphaRowBytes,
-            ],
-            color_primaries: image.colorPrimaries,
-            transfer_characteristics: image.transferCharacteristics,
-            matrix_coefficients: image.matrixCoefficients,
-            ..Default::default()
-        }
-    }
-}
-
 #[no_mangle]
 pub unsafe extern "C" fn crabby_avifRGBImageSetDefaults(
     rgb: *mut avifRGBImage,
     image: *const avifImage,
 ) {
-    let rgb = unsafe { &mut (*rgb) };
-    let image: image::Image = unsafe { &(*image) }.into();
-    *rgb = rgb::Image::create_from_yuv(&image).into();
+    let image: image::Image = deref_const!(image).into();
+    *deref_mut!(rgb) = rgb::Image::create_from_yuv(&image).into();
 }
 
 #[no_mangle]
@@ -160,14 +104,12 @@ pub unsafe extern "C" fn crabby_avifImageYUVToRGB(
     image: *const avifImage,
     rgb: *mut avifRGBImage,
 ) -> avifResult {
-    unsafe {
-        if (*image).yuvPlanes[0].is_null() {
-            return avifResult::Ok;
-        }
+    if deref_const!(image).yuvPlanes[0].is_null() {
+        return avifResult::Ok;
     }
-    let mut rgb: rgb::Image = unsafe { &(*rgb) }.into();
-    let image: image::Image = unsafe { &(*image) }.into();
-    to_avifResult(&rgb.convert_from_yuv(&image))
+    let mut rgb: rgb::Image = deref_const!(rgb).into();
+    let image: image::Image = deref_const!(image).into();
+    rgb.convert_from_yuv(&image).into()
 }
 
 fn CopyPlanes(dst: &mut avifImage, src: &Image) -> AvifResult<()> {
@@ -208,6 +150,9 @@ fn CopyPlanes(dst: &mut avifImage, src: &Image) -> AvifResult<()> {
             if plane == Plane::V && dst.yuvPlanes[2].is_null() {
                 let plane_size = usize_from_u32(plane_data.width * plane_data.height * 2)?;
                 dst.yuvPlanes[2] = unsafe { crabby_avifAlloc(plane_size) } as *mut _;
+                if dst.yuvPlanes[2].is_null() {
+                    return Err(AvifError::OutOfMemory);
+                }
                 dst.yuvRowBytes[2] = plane_data.width * 2;
             }
             let dst_planes = [
@@ -245,30 +190,33 @@ pub unsafe extern "C" fn crabby_avifImageScale(
     dstHeight: u32,
     _diag: *mut avifDiagnostics,
 ) -> avifResult {
-    // To avoid buffer reallocations, we only support scaling to a smaller size.
-    let dst_image = unsafe { &mut (*image) };
+    let dst_image = deref_mut!(image);
     if dstWidth > dst_image.width || dstHeight > dst_image.height {
+        // To avoid buffer reallocations, we only support scaling to a smaller size.
         return avifResult::NotImplemented;
     }
+    if dstWidth == dst_image.width && dstHeight == dst_image.height {
+        return avifResult::Ok;
+    }
 
-    let mut rust_image: image::Image = unsafe { &(*image) }.into();
+    let mut rust_image: image::Image = deref_const!(image).into();
     let res = rust_image.scale(dstWidth, dstHeight, Category::Color);
     if res.is_err() {
-        return to_avifResult(&res);
+        return res.into();
     }
     // The scale function is designed to work only for one category at a time.
     // Restore the width and height to the original values before scaling the
     // alpha plane.
-    rust_image.width = unsafe { (*image).width };
-    rust_image.height = unsafe { (*image).height };
+    rust_image.width = deref_const!(image).width;
+    rust_image.height = deref_const!(image).height;
     let res = rust_image.scale(dstWidth, dstHeight, Category::Alpha);
     if res.is_err() {
-        return to_avifResult(&res);
+        return res.into();
     }
 
     dst_image.width = rust_image.width;
     dst_image.height = rust_image.height;
     dst_image.depth = rust_image.depth as _;
     dst_image.yuvFormat = rust_image.yuv_format;
-    to_avifResult(&CopyPlanes(dst_image, &rust_image))
+    CopyPlanes(dst_image, &rust_image).into()
 }

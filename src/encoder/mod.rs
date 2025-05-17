@@ -21,8 +21,10 @@ use crate::encoder::mp4box::*;
 use crate::codecs::EncoderConfig;
 use crate::gainmap::GainMap;
 use crate::image::*;
+use crate::internal_utils::stream::IStream;
 use crate::internal_utils::stream::OStream;
 use crate::internal_utils::*;
+use crate::parser::exif;
 use crate::parser::mp4box::*;
 use crate::parser::obu::Av1SequenceHeader;
 use crate::utils::IFraction;
@@ -36,6 +38,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
 pub struct ScalingMode {
     pub horizontal: IFraction,
     pub vertical: IFraction,
@@ -62,7 +65,6 @@ impl Default for TilingMode {
     }
 }
 
-#[allow(unused)]
 impl TilingMode {
     fn log2(&self, width: u32, height: u32) -> (i32, i32) {
         match *self {
@@ -118,6 +120,8 @@ pub(crate) struct Sample {
 }
 
 impl Sample {
+    // This function is not used in all configurations.
+    #[allow(unused)]
     pub(crate) fn create_from(data: &[u8], sync: bool) -> AvifResult<Self> {
         let mut copied_data: Vec<u8> = create_vec_exact(data.len())?;
         copied_data.extend_from_slice(data);
@@ -227,14 +231,18 @@ impl Encoder {
         if self.image_metadata.exif.is_empty() {
             return Ok(());
         }
-        // TODO: find the TIFF header and include the offset in the payload.
+        let mut stream = IStream::create(&self.image_metadata.exif);
+        let tiff_header_offset = exif::parse_exif_tiff_header_offset(&mut stream)?;
+        let mut metadata_payload: Vec<u8> = create_vec_exact(4 + self.image_metadata.exif.len())?;
+        metadata_payload.extend_from_slice(&tiff_header_offset.to_be_bytes());
+        metadata_payload.extend_from_slice(&self.image_metadata.exif);
         self.items.push(Item {
             id: u16_from_usize(self.items.len() + 1)?,
             item_type: "Exif".into(),
             infe_name: "Exif".into(),
             iref_to_id: Some(self.primary_item_id),
             iref_type: Some("cdsc".into()),
-            metadata_payload: self.image_metadata.exif.clone(),
+            metadata_payload,
             ..Default::default()
         });
         Ok(())
