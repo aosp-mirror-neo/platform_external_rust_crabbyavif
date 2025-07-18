@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <tuple>
@@ -183,6 +184,85 @@ TEST(EncodingTest, VariousCases) {
                CRABBY_AVIF_DEFAULT_IMAGE_DIMENSION_LIMIT / 2, 8,
                AVIF_RESULT_OK);
 #endif
+}
+
+TEST(ImageTest, MetadataFunctions) {
+  // Fill data with some values.
+  constexpr int kSize = 10;
+  std::vector<uint8_t> data;
+  data.reserve(kSize);
+  for (int i = 0; i < kSize; ++i) {
+    data.push_back(i * 2);
+  }
+
+  ImagePtr image(avifImageCreateEmpty());
+  ASSERT_NE(image, nullptr);
+
+  for (auto* func : {avifImageSetMetadataExif, avifImageSetProfileICC,
+                     avifImageSetMetadataXMP}) {
+    const auto& metadata =
+        (func == avifImageSetMetadataExif)
+            ? image->exif
+            : ((func == avifImageSetProfileICC) ? image->icc : image->xmp);
+    EXPECT_NE(func(nullptr, nullptr, 0), AVIF_RESULT_OK);
+    EXPECT_EQ(func(image.get(), nullptr, 0), AVIF_RESULT_OK);
+    EXPECT_EQ(metadata.data, nullptr);
+    EXPECT_EQ(metadata.size, 0);
+    EXPECT_EQ(func(image.get(), data.data(), 0), AVIF_RESULT_OK);
+    EXPECT_EQ(metadata.data, nullptr);
+    EXPECT_EQ(metadata.size, 0);
+    EXPECT_EQ(func(image.get(), data.data(), kSize), AVIF_RESULT_OK);
+    EXPECT_NE(metadata.data, nullptr);
+    EXPECT_NE(metadata.data, data.data());
+    ASSERT_EQ(metadata.size, kSize);
+    EXPECT_EQ(memcmp(metadata.data, data.data(), kSize), 0);
+  }
+}
+
+TEST(ImageTest, NullCases) {
+  ImagePtr src(avifImageCreateEmpty());
+  ImagePtr dst(avifImageCreateEmpty());
+  // Both dst and src are nullptr.
+  EXPECT_NE(avifImageCopy(nullptr, nullptr, AVIF_PLANES_ALL), AVIF_RESULT_OK);
+  // src is nullptr.
+  EXPECT_NE(avifImageCopy(dst.get(), nullptr, AVIF_PLANES_ALL), AVIF_RESULT_OK);
+  // dst is nullptr.
+  EXPECT_NE(avifImageCopy(nullptr, src.get(), AVIF_PLANES_ALL), AVIF_RESULT_OK);
+
+  EXPECT_NE(avifImageAllocatePlanes(nullptr, AVIF_PLANES_ALL), AVIF_RESULT_OK);
+
+  // This should not crash.
+  avifImageFreePlanes(nullptr, AVIF_PLANES_ALL);
+
+  // This should not crash.
+  avifImageDestroy(nullptr);
+
+  EXPECT_FALSE(avifImageUsesU16(nullptr));
+  EXPECT_FALSE(avifImageIsOpaque(nullptr));
+  EXPECT_EQ(avifImagePlane(nullptr, 0), nullptr);
+  EXPECT_EQ(avifImagePlaneRowBytes(nullptr, 0), 0);
+  EXPECT_EQ(avifImagePlaneWidth(nullptr, 0), 0);
+  EXPECT_EQ(avifImagePlaneHeight(nullptr, 0), 0);
+
+  // Various nullptr combinations for avifImageSetViewRect.
+  EXPECT_NE(avifImageSetViewRect(nullptr, nullptr, nullptr), AVIF_RESULT_OK);
+
+  EXPECT_NE(avifRWDataRealloc(nullptr, 10), AVIF_RESULT_OK);
+
+  avifRWData rw_data;
+  uint8_t raw_data[10] = {0};
+  EXPECT_NE(avifRWDataSet(nullptr, nullptr, 10), AVIF_RESULT_OK);
+  EXPECT_NE(avifRWDataSet(&rw_data, nullptr, 10), AVIF_RESULT_OK);
+  EXPECT_NE(avifRWDataSet(nullptr, raw_data, 10), AVIF_RESULT_OK);
+
+  // This should not crash.
+  avifRWDataFree(nullptr);
+
+  EXPECT_EQ(avifIOCreateMemoryReader(nullptr, 10), nullptr);
+  EXPECT_EQ(avifIOCreateFileReader(nullptr), nullptr);
+
+  // This should not crash.
+  avifIODestroy(nullptr);
 }
 
 }  // namespace

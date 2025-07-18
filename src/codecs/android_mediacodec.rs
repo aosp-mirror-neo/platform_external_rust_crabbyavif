@@ -302,10 +302,13 @@ fn prefer_hardware_decoder(config: &DecoderConfig) -> bool {
         //    hardware for that is unreliable.
         // 3) profile is 0. As of Sep 2024, there are no AV1 hardware decoders that support
         //    anything other than profile 0.
+        // 4) depth is 8. Since we query for decoder simply by mime type, there is no way to know
+        //    if an AV1 hardware decoder supports 10-bit or not.
         prefer_hw
             && config.category != Category::Alpha
             && config.category != Category::Gainmap
             && config.codec_config.profile() == 0
+            && config.codec_config.depth() == 8
     } else {
         // We will return true when one of the following conditions are true:
         // 1) prefer_hw is true.
@@ -519,33 +522,62 @@ impl MediaCodec {
                     _ => MatrixCoefficients::Unspecified,
                 };
 
-                for i in 0usize..3 {
-                    if i == 2
-                        && matches!(
-                            image.yuv_format,
-                            PixelFormat::AndroidP010
-                                | PixelFormat::AndroidNv12
-                                | PixelFormat::AndroidNv21
-                        )
+                if image.yuv_format == PixelFormat::AndroidNv21 {
+                    #[cfg(feature = "libyuv")]
                     {
-                        // V plane is not needed for these formats.
-                        break;
+                        // Convert Nv21 images into Nv12 for the following reasons:
+                        // * Many of the yuv -> rgb conversions are optimized for Nv12 (Nv21 is also
+                        //   missing several cases).
+                        // * In Nv21 mode, some hardware decoders (e.g. c2.mtk.av1.decoder) will output
+                        //   Nv21 for the first few frames and then switch to Nv12. crabbyavif does not
+                        //   support cells within a same image to be of different pixel formats.
+                        image.yuv_format = PixelFormat::AndroidNv12;
+                        image.allocate_planes(category)?;
+                        let planes = image.plane_ptrs_mut();
+                        let row_bytes = image.plane_row_bytes()?;
+                        if unsafe {
+                            libyuv_sys::bindings::NV21ToNV12(
+                                buffer.offset(plane_info.offset[0]),
+                                i32_from_u32(plane_info.row_stride[0])?,
+                                buffer.offset(plane_info.offset[2]),
+                                i32_from_u32(plane_info.row_stride[2])?,
+                                planes[0],
+                                row_bytes[0],
+                                planes[1],
+                                row_bytes[1],
+                                i32_from_u32(image.width)?,
+                                i32_from_u32(image.height)?,
+                            )
+                        } != 0
+                        {
+                            return Err(AvifError::ReformatFailed);
+                        }
                     }
-                    image.row_bytes[i] = plane_info.row_stride[i];
-                    let plane_height = if i == 0 { image.height } else { (image.height + 1) / 2 };
-                    let offset_index = if i == 1 && image.yuv_format == PixelFormat::AndroidNv21 {
-                        // For Nv21, V plane comes before the U plane, so the UV plane offset
-                        // should point to the V plane.
-                        2
-                    } else {
-                        i
-                    };
-                    image.planes[i] = Some(Pixels::from_raw_pointer(
-                        unsafe { buffer.offset(plane_info.offset[offset_index]) },
-                        image.depth as u32,
-                        plane_height,
-                        image.row_bytes[i],
-                    )?);
+                    #[cfg(not(feature = "libyuv"))]
+                    {
+                        return Err(AvifError::NotImplemented);
+                    }
+                } else {
+                    for i in 0usize..3 {
+                        if i == 2
+                            && matches!(
+                                image.yuv_format,
+                                PixelFormat::AndroidP010 | PixelFormat::AndroidNv12
+                            )
+                        {
+                            // V plane is not needed for these formats.
+                            break;
+                        }
+                        image.row_bytes[i] = plane_info.row_stride[i];
+                        let plane_height =
+                            if i == 0 { image.height } else { (image.height + 1) / 2 };
+                        image.planes[i] = Some(Pixels::from_raw_pointer(
+                            unsafe { buffer.offset(plane_info.offset[i]) },
+                            image.depth as u32,
+                            plane_height,
+                            image.row_bytes[i],
+                        )?);
+                    }
                 }
             }
         }
@@ -831,6 +863,7 @@ impl Decoder for MediaCodec {
         _spatial_id: u8,
         grid_image_helper: &mut GridImageHelper,
     ) -> AvifResult<()> {
+        let starting_cell_index = grid_image_helper.cell_index;
         while self.codec_index < self.codec_initializers.len() {
             let res = self.get_next_image_grid_impl(payloads, grid_image_helper);
             if res.is_ok() {
@@ -839,6 +872,10 @@ impl Decoder for MediaCodec {
             // Drop the current codec and try the next one.
             self.drop_impl();
             self.codec_index += 1;
+            // Reset the cell_index so that each codec starts from the first cell. Mixing cells
+            // between codecs could result in different color formats for each cell which is not
+            // supported.
+            grid_image_helper.cell_index = starting_cell_index;
         }
         Err(AvifError::UnknownError(
             "all the codecs failed to extract an image".into(),

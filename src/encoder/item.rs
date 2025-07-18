@@ -437,6 +437,31 @@ impl Item {
         Ok(())
     }
 
+    pub(crate) fn write_edts(
+        &self,
+        stream: &mut OStream,
+        loop_count: u64,
+        duration: u64,
+    ) -> AvifResult<()> {
+        stream.start_box("edts")?;
+        {
+            let elst_flags = if loop_count == 1 { 0 } else { 1 };
+            stream.start_full_box("elst", (1, elst_flags))?;
+            // unsigned int(32) entry_count;
+            stream.write_u32(1)?;
+            // unsigned int(64) segment_duration;
+            stream.write_u64(duration)?;
+            // int(64) media_time;
+            stream.write_u64(0)?;
+            // int(16) media_rate_integer;
+            stream.write_u16(1)?;
+            // int(16) media_rate_fraction = 0;
+            stream.write_u16(0)?;
+            stream.finish_box()?;
+        }
+        stream.finish_box()
+    }
+
     pub(crate) fn write_vmhd(&self, stream: &mut OStream) -> AvifResult<()> {
         stream.start_full_box("vmhd", (0, 1))?;
         // template unsigned int(16) graphicsmode = 0; (copy over the existing image)
@@ -477,6 +502,13 @@ impl Item {
         stream.write_u8(0)?;
         stream.write_u8(0)?;
         stream.write_u8(0)?;
+        stream.finish_box()
+    }
+
+    pub(crate) fn write_auxi(&self, stream: &mut OStream) -> AvifResult<()> {
+        stream.start_full_box("auxi", (0, 0))?;
+        //  string aux_track_type;
+        stream.write_str_with_nul(AUXI_ALPHA_URN)?;
         stream.finish_box()
     }
 
@@ -533,6 +565,9 @@ impl Item {
                 // not.
             }
             self.write_ccst(stream)?;
+            if self.category == Category::Alpha {
+                self.write_auxi(stream)?;
+            }
 
             stream.finish_box()?;
         }
