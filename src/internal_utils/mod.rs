@@ -205,9 +205,10 @@ pub(crate) fn check_slice_range(len: usize, range: &Range<usize>) -> AvifResult<
     Ok(())
 }
 
+pub(crate) const AUXI_ALPHA_URN: &str = "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha";
+
 pub(crate) fn is_auxiliary_type_alpha(aux_type: &str) -> bool {
-    aux_type == "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha"
-        || aux_type == "urn:mpeg:hevc:2015:auxid:1"
+    aux_type == AUXI_ALPHA_URN || aux_type == "urn:mpeg:hevc:2015:auxid:1"
 }
 
 pub(crate) fn validate_grid_image_dimensions(image: &Image, grid: &Grid) -> AvifResult<()> {
@@ -279,6 +280,13 @@ pub(crate) fn floor_log2(n: u32) -> u32 {
     } else {
         31 - n.leading_zeros()
     }
+}
+
+// Checks if the given pointer and size can be safely used to create a slice with
+// std::slice::from_raw_parts: https://doc.rust-lang.org/std/slice/fn.from_raw_parts.html#safety
+#[cfg(feature = "capi")]
+pub(crate) fn check_slice_from_raw_parts_safety(data: *const u8, size: usize) -> bool {
+    !data.is_null() && size <= isize::MAX as usize
 }
 
 #[derive(Clone, Copy, Debug)]

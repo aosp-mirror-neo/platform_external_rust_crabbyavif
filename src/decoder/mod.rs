@@ -112,6 +112,16 @@ impl CodecChoice {
             }
         }
     }
+
+    #[allow(unused_mut)]
+    pub(crate) fn versions() -> String {
+        let mut versions: Vec<String> = vec![];
+        #[cfg(feature = "dav1d")]
+        {
+            versions.push(Dav1d::version());
+        }
+        versions.join(", ")
+    }
 }
 
 #[repr(C)]
@@ -386,7 +396,7 @@ pub(crate) struct GridImageHelper<'a> {
     grid: &'a Grid,
     image: &'a mut Image,
     pub category: Category,
-    cell_index: usize,
+    pub cell_index: usize,
     expected_cell_count: usize,
     codec_config: &'a CodecConfiguration,
     first_cell_image: Option<Image>,
@@ -395,7 +405,7 @@ pub(crate) struct GridImageHelper<'a> {
 }
 
 // These functions are not used in all configurations.
-#[allow(unused)]
+#[allow(dead_code)]
 impl GridImageHelper<'_> {
     pub(crate) fn is_grid_complete(&self) -> AvifResult<bool> {
         Ok(self.cell_index == self.expected_cell_count)
@@ -564,7 +574,7 @@ impl Decoder {
         &mut self,
         gainmap_id: u32,
         tonemap_id: u32,
-        #[allow(unused)] color_item_id: u32, // This parameter is unused in some configurations.
+        #[allow(unused_variables)] color_item_id: u32, // This parameter is unused in some configurations.
     ) -> AvifResult<()> {
         let gainmap_item = self
             .items

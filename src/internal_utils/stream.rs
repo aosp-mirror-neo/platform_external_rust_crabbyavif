@@ -80,7 +80,7 @@ pub struct IStream<'a> {
 }
 
 impl IStream<'_> {
-    pub(crate) fn create(data: &[u8]) -> IStream {
+    pub(crate) fn create<'a>(data: &'a [u8]) -> IStream<'a> {
         IStream { data, offset: 0 }
     }
 
@@ -91,7 +91,7 @@ impl IStream<'_> {
         Ok(())
     }
 
-    pub(crate) fn sub_stream(&mut self, size: &BoxSize) -> AvifResult<IStream> {
+    pub(crate) fn sub_stream<'a>(&'a mut self, size: &BoxSize) -> AvifResult<IStream<'a>> {
         let offset = self.offset;
         checked_incr!(
             self.offset,
@@ -109,7 +109,7 @@ impl IStream<'_> {
         })
     }
 
-    pub(crate) fn sub_bit_stream(&mut self, size: usize) -> AvifResult<IBitStream> {
+    pub(crate) fn sub_bit_stream<'a>(&'a mut self, size: usize) -> AvifResult<IBitStream<'a>> {
         self.check(size)?;
         let offset = self.offset;
         checked_incr!(self.offset, size);
@@ -386,6 +386,13 @@ impl OStream {
         Ok(())
     }
 
+    pub(crate) fn write_str_with_nul(&mut self, value: &str) -> AvifResult<()> {
+        assert!(self.partial.is_none());
+        self.write_str(value)?;
+        self.write_u8(0)?;
+        Ok(())
+    }
+
     pub(crate) fn write_string(&mut self, value: &String) -> AvifResult<()> {
         assert!(self.partial.is_none());
         let bytes = value.as_bytes();
@@ -399,6 +406,29 @@ impl OStream {
         self.write_string(value)?;
         self.write_u8(0)?;
         Ok(())
+    }
+
+    // Searches through existing data for the given slice starting at offset |start_offset| and
+    // writes it to the stream if it does not exist already. Returns the offset in which the slice
+    // was found or written to.
+    pub(crate) fn write_slice_dedupe(
+        &mut self,
+        start_offset: usize,
+        data: &[u8],
+    ) -> AvifResult<usize> {
+        Ok(
+            match self.data[start_offset..]
+                .windows(data.len())
+                .position(|window| window == data)
+            {
+                Some(position) => start_offset + position,
+                None => {
+                    let offset = self.offset();
+                    self.write_slice(data)?;
+                    offset
+                }
+            },
+        )
     }
 
     pub(crate) fn write_slice(&mut self, data: &[u8]) -> AvifResult<()> {
@@ -628,5 +658,31 @@ mod tests {
             stream.data[stream.data.len() - 4..],
             ufraction.1.to_be_bytes()
         );
+    }
+
+    #[cfg(feature = "encoder")]
+    #[test]
+    fn write_slice_dedupe() {
+        let mut stream = OStream::default();
+
+        assert!(stream.write_slice(&[1, 2, 3, 4, 5, 6]).is_ok());
+        assert_eq!(stream.offset(), 6);
+
+        // Duplicate slice should return an existing offset.
+        assert_eq!(stream.write_slice_dedupe(0, &[3, 4, 5]), Ok(2));
+        assert_eq!(stream.offset(), 6);
+
+        // Non-duplicate slice should extend the stream and return the new offset.
+        assert_eq!(stream.write_slice_dedupe(0, &[10, 11, 12]), Ok(6));
+        assert_eq!(stream.offset(), 9);
+
+        // Duplicate slice should return an existing offset.
+        assert_eq!(stream.write_slice_dedupe(0, &[10, 11, 12]), Ok(6));
+        assert_eq!(stream.offset(), 9);
+
+        // Duplicate slice but outside the start offset should extend the stream and return the new
+        // offset.
+        assert_eq!(stream.write_slice_dedupe(4, &[3, 4, 5]), Ok(9));
+        assert_eq!(stream.offset(), 12);
     }
 }
