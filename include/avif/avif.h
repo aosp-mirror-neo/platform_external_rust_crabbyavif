@@ -163,6 +163,9 @@ enum avifRGBFormat {
     AVIF_RGB_FORMAT_ABGR,
     AVIF_RGB_FORMAT_RGB565,
     AVIF_RGB_FORMAT_RGBA1010102,
+    AVIF_RGB_FORMAT_GRAY,
+    AVIF_RGB_FORMAT_GRAY_A,
+    AVIF_RGB_FORMAT_A_GRAY,
 };
 
 enum avifMatrixCoefficients : uint16_t {
@@ -256,11 +259,6 @@ enum avifCodecChoice {
 enum avifCodecFlag {
     AVIF_CODEC_FLAG_CAN_DECODE = (1 << 0),
     AVIF_CODEC_FLAG_CAN_ENCODE = (1 << 1),
-};
-
-enum avifHeaderFormat {
-    AVIF_HEADER_FULL,
-    AVIF_HEADER_REDUCED,
 };
 
 enum avifPlanesFlag {
@@ -469,6 +467,7 @@ struct avifDecoder {
     avifBool imageSequenceTrackPresent;
     AndroidMediaCodecOutputColorFormat androidMediaCodecOutputColorFormat;
     CompressionFormat compressionFormat;
+    avifBool allowSampleTransform;
     Box<Decoder> rust_decoder;
     avifImage image_object;
     avifGainMap gainmap_object;
@@ -541,6 +540,12 @@ struct avifEncoder {
     avifIOStats ioStats;
     avifDiagnostics diag;
     int32_t qualityGainMap;
+    /// Used when encoding an image sequence. Specified in seconds since midnight, Jan. 1, 1970 UTC
+    /// (the Unix epoch) If set to 0 (the default), now() is used.
+    uint64_t creationTime;
+    /// Used when encoding an image sequence. Specified in seconds since midnight, Jan. 1, 1970 UTC
+    /// (the Unix epoch) If set to 0 (the default), now() is used.
+    uint64_t modificationTime;
     Box<Encoder> rust_encoder;
     bool rust_encoder_initialized;
     Box<CodecSpecificOptions> codec_specific_options;

@@ -92,6 +92,40 @@ fn encode_decode(
     Ok(())
 }
 
+#[test_matrix([false, true])]
+fn encode_container_byte_exact(container_byte_exact: bool) -> AvifResult<()> {
+    if !HAS_ENCODER {
+        return Ok(());
+    }
+    let input_image =
+        generate_gradient_image(12, 34, 8, PixelFormat::Yuv420, YuvRange::Full, true)?;
+    let settings = encoder::Settings {
+        speed: Some(10),
+        creation_time: if container_byte_exact { Some(100) } else { None },
+        modification_time: if container_byte_exact { Some(200) } else { None },
+        ..Default::default()
+    };
+    let mut edata: [Vec<u8>; 2] = [vec![], vec![]];
+    for (i, edata_item) in edata.iter_mut().enumerate() {
+        let mut encoder = encoder::Encoder::create_with_settings(&settings)?;
+        encoder.add_image_for_sequence(&input_image, 100)?;
+        encoder.add_image_for_sequence(&input_image, 100)?;
+        *edata_item = encoder.finish()?;
+        assert!(!edata_item.is_empty());
+        if i == 0 {
+            // Sleep for 2 seconds between the iterations to ensure that the timestamps will be
+            // different on either files when now() is being used.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    }
+    if container_byte_exact {
+        assert_eq!(edata[0], edata[1]);
+    } else {
+        assert!(edata[0] != edata[1]);
+    }
+    Ok(())
+}
+
 fn encode_decode_grid_impl(
     cells_and_expect_success: (Vec<Vec<(u32, u32)>>, bool),
     yuv_format: PixelFormat,
@@ -859,6 +893,54 @@ fn gainmap_base_image_hdr() -> AvifResult<()> {
     assert!(psnr(&image, decoded_image)? >= 40.0);
     let decoded_gainmap = decoder.gainmap();
     assert!(psnr(&gainmap.image, &decoded_gainmap.image)? >= 40.0);
+    Ok(())
+}
+
+// From aviftransformtest.cc
+#[test]
+#[cfg(feature = "png")]
+fn alpha_transformative_properties() -> AvifResult<()> {
+    let mut reference = get_decoder("abc_color_irot_alpha_irot.avif");
+    reference.parse()?;
+    reference.next_image()?;
+    let reference = reference.image().unwrap();
+
+    let (mut image, _) = reader::Reader::read_frame(
+        &mut reader::png::PngReader::create(&get_test_file("abc.png"))?,
+        &reader::Config {
+            yuv_format: Some(PixelFormat::Yuv444),
+            matrix_coefficients: Some(reference.matrix_coefficients),
+            ..Default::default()
+        },
+    )?;
+    image.color_primaries = reference.color_primaries;
+    image.transfer_characteristics = reference.transfer_characteristics;
+    let mut encoder = encoder::Encoder::create_with_settings(&encoder::Settings {
+        speed: Some(10),
+        mutable: MutableSettings {
+            quality: 100,
+            quality_alpha: 100,
+            quality_gainmap: 100,
+            ..Default::default()
+        },
+        ..Default::default()
+    })?;
+    encoder.add_image(&image)?;
+    let encoded = encoder.finish()?;
+    assert!(!encoded.is_empty());
+
+    let mut decoder = decoder::Decoder::default();
+    decoder.set_io_vec(encoded);
+    decoder.settings.image_content_to_decode = ImageContentType::All;
+    decoder.parse()?;
+    decoder.next_image()?;
+    let decoded = decoder.image().unwrap();
+
+    // Check with existing correct AVIF file.
+    assert!(are_images_equal(decoded, reference)?);
+
+    // The rendering of the images should be compared but that is outside the
+    // scope of CrabbyAvif.
     Ok(())
 }
 

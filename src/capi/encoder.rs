@@ -46,6 +46,12 @@ pub struct avifEncoder {
     pub ioStats: crate::decoder::IOStats,
     pub diag: avifDiagnostics,
     pub qualityGainMap: i32,
+    /// Used when encoding an image sequence. Specified in seconds since midnight, Jan. 1, 1970 UTC
+    /// (the Unix epoch) If set to 0 (the default), now() is used.
+    pub creationTime: u64,
+    /// Used when encoding an image sequence. Specified in seconds since midnight, Jan. 1, 1970 UTC
+    /// (the Unix epoch) If set to 0 (the default), now() is used.
+    pub modificationTime: u64,
     rust_encoder: Box<Encoder>,
     rust_encoder_initialized: bool,
     codec_specific_options: Box<CodecSpecificOptions>,
@@ -76,6 +82,8 @@ impl Default for avifEncoder {
             diag: Default::default(),
             qualityGainMap: AVIF_QUALITY_DEFAULT,
             rust_encoder: Default::default(),
+            creationTime: 0,
+            modificationTime: 0,
             rust_encoder_initialized: false,
             codec_specific_options: Default::default(),
         }
@@ -117,16 +125,35 @@ impl From<&avifEncoder> for MutableSettings {
 impl From<&avifEncoder> for Settings {
     fn from(encoder: &avifEncoder) -> Self {
         Self {
+            codec_choice: match encoder.codecChoice {
+                avifCodecChoice::Auto => CodecChoice::Auto,
+                avifCodecChoice::Aom => CodecChoice::Aom,
+                // Silently treat all other choices the same as Auto.
+                _ => CodecChoice::Auto,
+            },
             threads: encoder.maxThreads as u32,
             speed: if encoder.speed >= 0 && encoder.speed <= 10 {
                 Some(encoder.speed as u32)
             } else {
                 None
             },
+            header_format: HeaderFormat::default(),
             keyframe_interval: encoder.keyframeInterval,
             timescale: if encoder.timescale == 0 { 1 } else { encoder.timescale },
             repetition_count: RepetitionCount::create_from(encoder.repetitionCount),
             extra_layer_count: encoder.extraLayerCount,
+            recipe: Recipe::None,
+            write_extended_pixi: false,
+            creation_time: if encoder.creationTime == 0 {
+                None
+            } else {
+                Some(encoder.creationTime)
+            },
+            modification_time: if encoder.modificationTime == 0 {
+                None
+            } else {
+                Some(encoder.modificationTime)
+            },
             mutable: encoder.into(),
         }
     }
@@ -300,7 +327,7 @@ pub unsafe extern "C" fn crabby_avifEncoderAddImageGrid(
         rust_encoder(encoder).add_image_grid(gridCols, gridRows, &image_refs)
     } else {
         // Some cells had GainMap and some did not. This is invalid.
-        Err(AvifError::InvalidArgument)
+        AvifError::invalid_argument()
     };
     encoder_ref.diag.set_from_result(&res);
     res.into()
