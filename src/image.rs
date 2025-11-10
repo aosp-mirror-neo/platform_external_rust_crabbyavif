@@ -109,12 +109,6 @@ pub struct PlaneData {
     pub pixel_size: u32,
 }
 
-#[derive(Clone, Copy)]
-pub enum PlaneRow<'a> {
-    Depth8(&'a [u8]),
-    Depth16(&'a [u16]),
-}
-
 impl Image {
     pub(crate) fn shallow_clone(&self) -> Self {
         Self {
@@ -313,14 +307,6 @@ impl Image {
         Ok(&mut self.row16_mut(plane, row)?[0..width])
     }
 
-    pub(crate) fn row_generic<'a>(&'a self, plane: Plane, row: u32) -> AvifResult<PlaneRow<'a>> {
-        Ok(if self.depth == 8 {
-            PlaneRow::Depth8(self.row(plane, row)?)
-        } else {
-            PlaneRow::Depth16(self.row16(plane, row)?)
-        })
-    }
-
     #[cfg(feature = "libyuv")]
     pub(crate) fn plane_ptrs(&self) -> [*const u8; 4] {
         ALL_PLANES.map(|x| {
@@ -448,7 +434,7 @@ impl Image {
     #[cfg(feature = "encoder")]
     pub(crate) fn copy_and_pad(&mut self, image: &Image) -> AvifResult<()> {
         if image.width > self.width || image.height > self.height {
-            return Err(AvifError::InvalidArgument);
+            return AvifError::invalid_argument();
         }
         self.allocate_planes(Category::Color)?;
         if image.has_alpha() {
@@ -489,7 +475,6 @@ impl Image {
         tile_index: u32,
         category: Category,
     ) -> AvifResult<()> {
-        // This function is used only when |tile| contains pointers and self contains buffers.
         let row_index = tile_index / grid.columns;
         let column_index = tile_index % grid.columns;
         for plane in category.planes() {
@@ -689,5 +674,24 @@ impl Image {
             }
         }
         true
+    }
+
+    pub(crate) fn fill_plane_with_value(&mut self, plane: Plane, value: u16) -> AvifResult<()> {
+        if let Some(plane_data) = self.plane_data(plane) {
+            if self.depth == 8 {
+                for y in 0..plane_data.height {
+                    let row =
+                        &mut self.row_exact_mut(plane, y).unwrap()[..plane_data.width as usize];
+                    row.fill(value as u8);
+                }
+            } else {
+                for y in 0..plane_data.height {
+                    let row =
+                        &mut self.row16_exact_mut(plane, y).unwrap()[..plane_data.width as usize];
+                    row.fill(value);
+                }
+            }
+        }
+        Ok(())
     }
 }

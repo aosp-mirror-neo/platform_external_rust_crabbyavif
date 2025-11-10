@@ -44,7 +44,7 @@ impl Writer for JpegWriter {
                 image.height,
                 image::ExtendedColorType::Rgb8,
             )
-            .or(Err(AvifError::UnknownError("Jpeg encoding failed".into())))?;
+            .map_err(AvifError::map_unknown_error)?;
         Ok(())
     }
 }

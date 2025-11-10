@@ -13,7 +13,12 @@
 // limitations under the License.
 
 #![deny(unsafe_op_in_unsafe_fn)]
-#![cfg_attr(feature = "disable_cfi", feature(no_sanitize))]
+#![cfg_attr(feature = "disable_cfi", feature(sanitize))]
+// Clippy flags this as a false positive for some of the uses in this library. Disable this clippy
+// warning.
+#![allow(clippy::cast_slice_from_raw_parts)]
+// This is a new feature which became stable in Feb 2025. Older compilers cannot use it.
+#![allow(clippy::manual_is_multiple_of)]
 
 #[macro_use]
 mod internal_utils;
@@ -49,6 +54,29 @@ impl std::hash::BuildHasher for NonRandomHasherState {
 
 pub type HashMap<K, V> = std::collections::HashMap<K, V, NonRandomHasherState>;
 pub type HashSet<K> = std::collections::HashSet<K, NonRandomHasherState>;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum CodecChoice {
+    #[default]
+    Auto, // Uses the first available codec in the following decreasing order of preference:
+    Aom,        // AVIF (AV1-HEIF) encoder.
+    MediaCodec, // AVIF (AV1-HEIF) and HEIC (HEVC-HEIF) decoder on Android.
+    Dav1d,      // AVIF (AV1-HEIF) decoder.
+    Libgav1,    // AVIF (AV1-HEIF) decoder.
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum HeaderFormat {
+    #[default]
+    Default,
+    // AVIF file with a "mif3" brand and a MinimizedImageBox to reduce the encoded file size.
+    // This is based on the w24144 "Low-overhead image file format" MPEG proposal for HEIF.
+    // WARNING: Experimental feature. Produces files that are incompatible with older decoders.
+    // If this flag is omitted or if MinimizedImageBox cannot be used at encoding, falls back to an
+    // AVIF file with an "avif" brand, a MetaBox and all its required boxes for maximum compatibility.
+    Mini,
+}
 
 /// cbindgen:enum-trailing-values=[Count]
 #[repr(C)]
@@ -427,7 +455,11 @@ pub(crate) struct Grid {
 #[cfg(feature = "encoder")]
 impl Grid {
     pub(crate) fn is_last_column(&self, index: u32) -> bool {
-        (index + 1) % self.columns == 0
+        if self.columns == 0 {
+            true
+        } else {
+            (index + 1) % self.columns == 0
+        }
     }
 
     pub(crate) fn is_last_row(&self, index: u32) -> bool {
@@ -532,10 +564,15 @@ impl RepetitionCount {
 }
 
 pub fn codec_versions() -> String {
-    let versions = &[
-        decoder::CodecChoice::versions(),
+    let versions: &[String] = &[
         #[cfg(feature = "aom")]
         codecs::aom::Aom::version(),
+        #[cfg(feature = "android_mediacodec")]
+        "android_mediacodec".into(),
+        #[cfg(feature = "dav1d")]
+        codecs::dav1d::Dav1d::version(),
+        #[cfg(feature = "libgav1")]
+        codecs::libgav1::Libgav1::version(),
     ];
     versions.join(", ")
 }

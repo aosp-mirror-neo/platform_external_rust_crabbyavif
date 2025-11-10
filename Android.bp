@@ -54,6 +54,9 @@ rust_library {
     shared_libs: [
         "libmediandk",
     ],
+    features: [
+        "android_mediacodec",
+    ],
 }
 
 rust_bindgen {
@@ -86,6 +89,9 @@ rust_library {
     shared_libs: [
         "libc++",
         "libjpeg",
+    ],
+    features: [
+        "libyuv",
     ],
 }
 

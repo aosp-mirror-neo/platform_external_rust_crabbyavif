@@ -17,14 +17,19 @@ use super::libyuv;
 use super::rgb_impl;
 use super::sharpyuv;
 
+use crate::checked_mul;
 use crate::image::Plane;
 use crate::image::YuvRange;
 use crate::internal_utils::*;
 use crate::utils::pixels::*;
-use crate::*;
+use crate::AvifError;
+use crate::AvifResult;
+use crate::Category;
+use crate::MatrixCoefficients;
+use crate::PixelFormat;
 
 #[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Format {
     Rgb,
     #[default]
@@ -35,6 +40,9 @@ pub enum Format {
     Abgr,
     Rgb565,
     Rgba1010102, // https://developer.android.com/reference/android/graphics/Bitmap.Config#RGBA_1010102
+    Gray,
+    GrayA,
+    AGray,
 }
 
 impl Format {
@@ -46,7 +54,9 @@ impl Format {
             Format::Bgr => [2, 1, 0, 0],
             Format::Bgra => [2, 1, 0, 3],
             Format::Abgr => [3, 2, 1, 0],
-            Format::Rgb565 | Format::Rgba1010102 => [0; 4],
+            Format::Rgb565 | Format::Rgba1010102 | Format::Gray => [0; 4],
+            Format::GrayA => [0, 0, 0, 1],
+            Format::AGray => [1, 0, 0, 0],
         }
     }
 
@@ -67,15 +77,19 @@ impl Format {
     }
 
     pub fn has_alpha(&self) -> bool {
-        !matches!(self, Format::Rgb | Format::Bgr | Format::Rgb565)
+        !matches!(
+            self,
+            Format::Rgb | Format::Bgr | Format::Rgb565 | Format::Gray
+        )
     }
 
     pub fn channel_count(&self) -> u32 {
         match self {
             Format::Rgba | Format::Bgra | Format::Argb | Format::Abgr => 4,
             Format::Rgb | Format::Bgr => 3,
-            Format::Rgb565 => 2,
+            Format::Rgb565 | Format::GrayA | Format::AGray => 2,
             Format::Rgba1010102 => 0, // This is never used.
+            Format::Gray => 1,
         }
     }
 
@@ -84,6 +98,10 @@ impl Format {
             Format::Rgb565 => 2,
             _ => self.channel_count() * if depth > 8 { 2 } else { 1 },
         }
+    }
+
+    pub(crate) fn is_gray(&self) -> bool {
+        matches!(self, Format::Gray | Format::GrayA | Format::AGray)
     }
 }
 
@@ -153,8 +171,8 @@ pub(crate) enum Mode {
     YcgcoRo,
 }
 
-impl From<&image::Image> for Mode {
-    fn from(image: &image::Image) -> Self {
+impl From<&crate::image::Image> for Mode {
+    fn from(image: &crate::image::Image) -> Self {
         match image.matrix_coefficients {
             MatrixCoefficients::Identity => Mode::Identity,
             MatrixCoefficients::Ycgco => Mode::Ycgco,
@@ -178,11 +196,13 @@ impl Image {
         self.max_channel() as f32
     }
 
-    pub fn create_from_yuv(image: &image::Image) -> Self {
+    pub fn create_from_yuv(image: &crate::image::Image) -> Self {
         Self {
             width: image.width,
             height: image.height,
             depth: image.depth,
+            // In libavif, Rgba is the default format. So we cannot set this based on
+            // image.alpha_present without breaking the C API contract.
             format: Format::Rgba,
             chroma_upsampling: ChromaUpsampling::Automatic,
             chroma_downsampling: ChromaDownsampling::Automatic,
@@ -274,8 +294,14 @@ impl Image {
 
     pub fn has_alpha(&self) -> bool {
         match self.format {
-            Format::Rgba | Format::Bgra | Format::Argb | Format::Abgr | Format::Rgba1010102 => true,
-            Format::Rgb | Format::Bgr | Format::Rgb565 => false,
+            Format::Rgba
+            | Format::Bgra
+            | Format::Argb
+            | Format::Abgr
+            | Format::Rgba1010102
+            | Format::GrayA
+            | Format::AGray => true,
+            Format::Rgb | Format::Bgr | Format::Rgb565 | Format::Gray => false,
         }
     }
 
@@ -297,18 +323,15 @@ impl Image {
             Format::Rgb | Format::Bgr => self.channel_size() * 3,
             Format::Rgb565 => 2,
             Format::Rgba1010102 => 4,
+            Format::Gray => self.channel_size(),
+            Format::GrayA | Format::AGray => self.channel_size() * 2,
         }
     }
 
     fn convert_to_half_float(&mut self) -> AvifResult<()> {
         let scale = 1.0 / self.max_channel_f();
-        match libyuv::convert_to_half_float(self, scale) {
-            Ok(_) => return Ok(()),
-            Err(err) => {
-                if err != AvifError::NotImplemented {
-                    return Err(err);
-                }
-            }
+        if libyuv::convert_to_half_float(self, scale)?.is_some() {
+            return Ok(());
         }
         // This constant comes from libyuv. For details, see here:
         // https://chromium.googlesource.com/libyuv/libyuv/+/2f87e9a7/source/row_common.cc#3537
@@ -323,9 +346,9 @@ impl Image {
         Ok(())
     }
 
-    pub fn convert_from_yuv(&mut self, image: &image::Image) -> AvifResult<()> {
+    pub fn convert_from_yuv(&mut self, image: &crate::image::Image) -> AvifResult<()> {
         if !image.has_plane(Plane::Y) || !image.depth_valid() || !self.depth_valid() {
-            return Err(AvifError::ReformatFailed);
+            return AvifError::reformat_failed();
         }
         if matches!(
             image.matrix_coefficients,
@@ -335,24 +358,24 @@ impl Image {
                 | MatrixCoefficients::ChromaDerivedCl
                 | MatrixCoefficients::Ictcp
         ) {
-            return Err(AvifError::NotImplemented);
+            return AvifError::not_implemented();
         }
         if image.matrix_coefficients == MatrixCoefficients::Ycgco
             && image.yuv_range == YuvRange::Limited
         {
-            return Err(AvifError::NotImplemented);
+            return AvifError::not_implemented();
         }
         if matches!(
             image.matrix_coefficients,
             MatrixCoefficients::YcgcoRe | MatrixCoefficients::YcgcoRo
         ) {
             if image.yuv_range == YuvRange::Limited {
-                return Err(AvifError::NotImplemented);
+                return AvifError::not_implemented();
             }
             let bit_offset =
                 if image.matrix_coefficients == MatrixCoefficients::YcgcoRe { 2 } else { 1 };
             if image.depth - bit_offset != self.depth {
-                return Err(AvifError::NotImplemented);
+                return AvifError::not_implemented();
             }
         }
         // Android MediaCodec maps all underlying YUV formats to PixelFormat::Yuv420. So do not
@@ -362,7 +385,7 @@ impl Image {
         if image.matrix_coefficients == MatrixCoefficients::Identity
             && !matches!(image.yuv_format, PixelFormat::Yuv444 | PixelFormat::Yuv400)
         {
-            return Err(AvifError::NotImplemented);
+            return AvifError::not_implemented();
         }
 
         let mut alpha_multiply_mode = if image.has_alpha() {
@@ -385,16 +408,9 @@ impl Image {
         let mut converted_with_libyuv: bool = false;
         let mut alpha_reformatted_with_libyuv = false;
         if alpha_multiply_mode == AlphaMultiplyMode::NoOp || self.has_alpha() {
-            match libyuv::yuv_to_rgb(image, self) {
-                Ok(alpha_reformatted) => {
-                    alpha_reformatted_with_libyuv = alpha_reformatted;
-                    converted_with_libyuv = true;
-                }
-                Err(err) => {
-                    if err != AvifError::NotImplemented {
-                        return Err(err);
-                    }
-                }
+            if let Some(alpha_reformatted) = libyuv::yuv_to_rgb(image, self)? {
+                alpha_reformatted_with_libyuv = alpha_reformatted;
+                converted_with_libyuv = true;
             }
         }
         if image.yuv_format == PixelFormat::AndroidNv21 || self.format == Format::Rgba1010102 {
@@ -407,7 +423,7 @@ impl Image {
                 }
                 return Ok(());
             } else {
-                return Err(AvifError::NotImplemented);
+                return AvifError::not_implemented();
             }
         }
         if self.has_alpha() && !alpha_reformatted_with_libyuv {
@@ -419,20 +435,14 @@ impl Image {
         }
         if !converted_with_libyuv {
             let mut converted_by_fast_path = false;
-            if (matches!(
-                self.chroma_upsampling,
-                ChromaUpsampling::Nearest | ChromaUpsampling::Fastest
-            ) || matches!(image.yuv_format, PixelFormat::Yuv444 | PixelFormat::Yuv400))
+            if !self.format.is_gray()
+                && (matches!(
+                    self.chroma_upsampling,
+                    ChromaUpsampling::Nearest | ChromaUpsampling::Fastest
+                ) || matches!(image.yuv_format, PixelFormat::Yuv444 | PixelFormat::Yuv400))
                 && (alpha_multiply_mode == AlphaMultiplyMode::NoOp || self.format.has_alpha())
             {
-                match rgb_impl::yuv_to_rgb_fast(image, self) {
-                    Ok(_) => converted_by_fast_path = true,
-                    Err(err) => {
-                        if err != AvifError::NotImplemented {
-                            return Err(err);
-                        }
-                    }
-                }
+                converted_by_fast_path = rgb_impl::yuv_to_rgb_fast(image, self)?.is_some();
             }
             if !converted_by_fast_path {
                 rgb_impl::yuv_to_rgb_any(image, self, alpha_multiply_mode)?;
@@ -450,9 +460,9 @@ impl Image {
         Ok(())
     }
 
-    pub fn convert_to_yuv(&self, image: &mut image::Image) -> AvifResult<()> {
+    pub fn convert_to_yuv(&self, image: &mut crate::image::Image) -> AvifResult<()> {
         if self.format == Format::Rgb565 || self.is_float {
-            return Err(AvifError::NotImplemented);
+            return AvifError::not_implemented();
         }
         image.allocate_planes(Category::Color)?;
         // TODO: b/410088660 - add a setting to ignore alpha channel.
@@ -466,27 +476,19 @@ impl Image {
                 (true, true, false) => AlphaMultiplyMode::UnMultiply,
                 _ => AlphaMultiplyMode::NoOp,
             };
-        // TODO: b/410088660 - support gray rgb formats.
-        let mut conversion_complete = false;
-        if self.chroma_downsampling == ChromaDownsampling::SharpYuv {
-            match sharpyuv::rgb_to_yuv(self, image) {
-                Ok(_) => conversion_complete = true,
-                Err(err) => return Err(err),
+        if self.format.is_gray() {
+            rgb_impl::rgb_gray_to_yuv(self, image)?;
+        } else {
+            let mut conversion_complete = false;
+            if self.chroma_downsampling == ChromaDownsampling::SharpYuv {
+                sharpyuv::rgb_to_yuv(self, image)?;
+                conversion_complete = true;
+            } else if alpha_multiply_mode == AlphaMultiplyMode::NoOp {
+                conversion_complete = libyuv::rgb_to_yuv(self, image)?.is_some();
             }
-        } else if alpha_multiply_mode == AlphaMultiplyMode::NoOp {
-            match libyuv::rgb_to_yuv(self, image) {
-                Ok(_) => {
-                    conversion_complete = true;
-                }
-                Err(err) => {
-                    if err != AvifError::NotImplemented {
-                        return Err(err);
-                    }
-                }
+            if !conversion_complete {
+                rgb_impl::rgb_to_yuv(self, image)?;
             }
-        }
-        if !conversion_complete {
-            rgb_impl::rgb_to_yuv(self, image)?;
         }
         if image.has_plane(Plane::A) {
             if has_alpha {
@@ -503,7 +505,7 @@ impl Image {
             return Ok(self);
         }
         if self.format == Format::Rgb565 || format == Format::Rgb565 {
-            return Err(AvifError::NotImplemented);
+            return AvifError::not_implemented();
         }
 
         let mut dst = Image {
@@ -572,6 +574,7 @@ mod tests {
     use crate::image::ALL_PLANES;
     use crate::image::MAX_PLANE_COUNT;
     use crate::Category;
+    use crate::ColorPrimaries;
 
     use test_case::test_case;
     use test_case::test_matrix;
@@ -672,7 +675,7 @@ mod tests {
     fn rgb_conversion(rgb_param_index: usize) -> AvifResult<()> {
         let rgb_params = &RGB_PARAMS[rgb_param_index];
         let yuv_params = &YUV_PARAMS[rgb_params.params.0];
-        let mut image = image::Image {
+        let mut image = crate::image::Image {
             width: yuv_params.width,
             height: yuv_params.height,
             depth: yuv_params.depth,
@@ -680,7 +683,7 @@ mod tests {
             color_primaries: yuv_params.color_primaries,
             matrix_coefficients: yuv_params.matrix_coefficients,
             yuv_range: yuv_params.yuv_range,
-            ..image::Image::default()
+            ..crate::image::Image::default()
         };
         image.allocate_planes(Category::Color)?;
         image.allocate_planes(Category::Alpha)?;
@@ -691,6 +694,7 @@ mod tests {
                 continue;
             }
             let plane_width = image.width(plane);
+            #[allow(clippy::needless_range_loop)]
             for y in 0..image.height(plane) {
                 let row16 = image.row16_mut(plane, y as u32)?;
                 let dst = &mut row16[..plane_width];

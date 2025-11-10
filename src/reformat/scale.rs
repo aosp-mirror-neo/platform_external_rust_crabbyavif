@@ -24,7 +24,7 @@ impl Image {
             return Ok(());
         }
         if width == 0 || height == 0 {
-            return Err(AvifError::InvalidArgument);
+            return AvifError::invalid_argument();
         }
         let planes = category.planes();
         let src =
@@ -69,7 +69,7 @@ impl Image {
                     )
                 };
                 if ret != 0 {
-                    return Err(AvifError::ReformatFailed);
+                    return AvifError::reformat_failed();
                 }
                 i010
             } else {
@@ -103,7 +103,7 @@ impl Image {
         self.yuv_format = src.yuv_format;
         if src.has_plane(Plane::Y) || src.has_plane(Plane::A) {
             if src.width > 16384 || src.height > 16384 {
-                return Err(AvifError::NotImplemented);
+                return AvifError::not_implemented();
             }
             if src.has_plane(Plane::Y) && category != Category::Alpha {
                 self.allocate_planes(Category::Color)?;
@@ -145,7 +145,7 @@ impl Image {
                 )
             };
             if ret != 0 {
-                return Err(AvifError::ReformatFailed);
+                return AvifError::reformat_failed();
             } else {
                 return Ok(());
             }
@@ -190,7 +190,18 @@ impl Image {
                         i32_from_u32(dst_pd.row_bytes)?,
                         i32_from_u32(dst_pd.width)?,
                         i32_from_u32(dst_pd.height)?,
-                        FilterMode_kFilterBox,
+                        if cfg!(feature = "android_mediacodec")
+                            && (*plane == Plane::U || *plane == Plane::V)
+                        {
+                            // In Android, use bilinear filter for chroma planes. libyuv uses only
+                            // bilinear filtering for NV12Scale. So in order to be consistent
+                            // between Nv12 and Yuv420, we need to use bilinear filter here so that
+                            // the output looks the same irrespective of the decoder's color
+                            // format.
+                            FilterMode_kFilterBilinear
+                        } else {
+                            FilterMode_kFilterBox
+                        },
                     )
                 }
             };

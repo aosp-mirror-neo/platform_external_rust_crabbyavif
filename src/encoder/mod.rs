@@ -13,7 +13,9 @@
 // limitations under the License.
 
 pub mod item;
+pub mod mini;
 pub mod mp4box;
+mod sampletransform;
 
 use crate::encoder::item::*;
 use crate::encoder::mp4box::*;
@@ -92,9 +94,9 @@ impl TilingMode {
 
 #[derive(Clone, Copy, Debug)]
 pub struct MutableSettings {
-    pub quality: i32,
-    pub quality_alpha: i32,
-    pub quality_gainmap: i32,
+    pub quality: f32,
+    pub quality_alpha: f32,
+    pub quality_gainmap: f32,
     pub tiling_mode: TilingMode,
     pub scaling_mode: ScalingMode,
 }
@@ -102,52 +104,94 @@ pub struct MutableSettings {
 impl Default for MutableSettings {
     fn default() -> Self {
         Self {
-            quality: 60,
-            quality_alpha: 60,
-            quality_gainmap: 60,
+            quality: 60.0,
+            quality_alpha: 60.0,
+            quality_gainmap: 60.0,
             tiling_mode: Default::default(),
             scaling_mode: Default::default(),
         }
     }
 }
 
+// Scheme for splitting, combining and/or transforming the input samples to
+// bypass some codec or format limits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Recipe {
+    // Automatically apply one of the Recipes below based on the input samples.
+    Auto,
+    // Do not split or transform the input samples. An error is returned if the
+    // selected codec or base video format does not support encoding the input
+    // samples as is (AV1 does not support 16-bit samples for example).
+    None,
+    // Encode the 8 most significant bits of each input image sample losslessly
+    // into a base image. The remaining 8 least significant bits are encoded in
+    // a separate hidden image item. The two are combined at decoding into one
+    // image with the same bit depth as the original image. It is backward
+    // compatible in the sense that it is possible to decode only the base image
+    // (ignoring the hidden image item), leading to a valid image but with
+    // precision loss (16-bit samples truncated to the 8 most significant bits).
+    BitDepthExtension8b8b,
+}
+
+impl CodecChoice {
+    fn get_item_type_and_encoder_codec(&self) -> Result<(&str, Codec), AvifError> {
+        match self {
+            #[cfg(feature = "aom")]
+            CodecChoice::Auto | CodecChoice::Aom => Ok(("av01", Box::<Aom>::default())),
+            _ => AvifError::no_codec_available(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
+    pub codec_choice: CodecChoice,
     pub threads: u32,
     pub speed: Option<u32>,
+    pub header_format: HeaderFormat,
     pub keyframe_interval: i32,
     pub timescale: u64,
     pub repetition_count: RepetitionCount,
     pub extra_layer_count: u32,
+    pub recipe: Recipe,
+    pub force_write_extended_pixi: bool,
+    pub creation_time: Option<u64>,
+    pub modification_time: Option<u64>,
     pub mutable: MutableSettings,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            codec_choice: CodecChoice::default(),
             threads: 1,
             speed: None,
+            header_format: HeaderFormat::default(),
             keyframe_interval: 0,
             timescale: 1,
             repetition_count: RepetitionCount::Infinite,
             extra_layer_count: 0,
+            recipe: Recipe::None,
+            force_write_extended_pixi: false,
+            creation_time: None,
+            modification_time: None,
             mutable: Default::default(),
         }
     }
 }
 
 impl Settings {
-    pub(crate) fn quantizer(&self, category: Category) -> i32 {
-        let quality = match category {
-            Category::Color => self.mutable.quality,
-            Category::Alpha => self.mutable.quality_alpha,
-            Category::Gainmap => self.mutable.quality_gainmap,
-        };
-        ((100 - quality) * 63 + 50) / 100
-    }
-
     pub(crate) fn is_valid(&self) -> bool {
         self.extra_layer_count < MAX_AV1_LAYER_COUNT as u32 && self.timescale > 0
+    }
+
+    pub(crate) fn must_write_extended_pixi(&self) -> bool {
+        // TODO: b/456440247 - Add support for codecs requiring extended pixi.
+        self.force_write_extended_pixi
+    }
+    pub(crate) fn codec_supports_native_alpha_channel(&self) -> bool {
+        // TODO: b/456440247 - Add support for codecs with native alpha channels.
+        false
     }
 }
 
@@ -177,28 +221,25 @@ pub(crate) type Codec = Box<dyn crate::codecs::Encoder>;
 pub(crate) type CodecSpecificOptions = HashMap<(Option<Category>, String), String>;
 
 #[derive(Default)]
-#[allow(dead_code)]
 pub struct Encoder {
     settings: Settings,
     items: Vec<Item>,
     image_metadata: Image,
     gainmap_image_metadata: Image,
     alt_image_metadata: Image,
-    quantizer: i32,
     primary_item_id: u16,
     alternative_item_ids: Vec<u16>,
-    single_image: bool,
     alpha_present: bool,
-    image_item_type: String,
-    config_property_name: String,
     duration_in_timescales: Vec<u64>,
     codec_specific_options: CodecSpecificOptions,
+    final_recipe: Option<Recipe>, // Decided when the first image is added.
+                                  // Guaranteed not to be Recipe::Auto.
 }
 
 impl Encoder {
     pub fn create_with_settings(settings: &Settings) -> AvifResult<Self> {
         if !settings.is_valid() {
-            return Err(AvifError::InvalidArgument);
+            return AvifError::invalid_argument();
         }
         Ok(Self {
             settings: *settings,
@@ -238,37 +279,40 @@ impl Encoder {
         Ok(item_id)
     }
 
-    fn add_items(&mut self, grid: &Grid, category: Category) -> AvifResult<u16> {
+    fn add_items(&mut self, grid: &Grid, category: Category, hidden: bool) -> AvifResult<u16> {
         let cell_count = usize_from_u32(grid.rows * grid.columns)?;
         let mut top_level_item_id = 0;
         if cell_count > 1 {
             let mut stream = OStream::default();
             write_grid(&mut stream, grid)?;
-            let item = Item {
+            let grid_item = Item {
                 id: u16_from_usize(self.items.len() + 1)?,
                 item_type: "grid".into(),
                 infe_name: category.infe_name(),
                 category,
                 grid: Some(*grid),
                 metadata_payload: stream.data,
-                hidden_image: category == Category::Gainmap,
+                hidden_image: hidden,
                 ..Default::default()
             };
-            top_level_item_id = item.id;
-            self.items.push(item);
+            top_level_item_id = grid_item.id;
+            self.items.push(grid_item);
         }
         for cell_index in 0..cell_count {
+            let (item_type, codec) = self
+                .settings
+                .codec_choice
+                .get_item_type_and_encoder_codec()?;
             let item = Item {
                 id: u16_from_usize(self.items.len() + 1)?,
-                item_type: "av01".into(),
+                item_type: item_type.into(),
                 infe_name: category.infe_name(),
                 cell_index,
                 category,
                 dimg_from_id: if cell_count > 1 { Some(top_level_item_id) } else { None },
-                hidden_image: cell_count > 1,
+                hidden_image: hidden || cell_count > 1,
                 extra_layer_count: self.settings.extra_layer_count,
-                #[cfg(feature = "aom")]
-                codec: Some(Box::<Aom>::default()),
+                codec: Some(codec),
                 ..Default::default()
             };
             if cell_count == 1 {
@@ -338,12 +382,15 @@ impl Encoder {
         self.alt_image_metadata.clli = Some(gainmap.alt_clli);
     }
 
-    fn validate_image_grid(grid: &Grid, images: &[&Image]) -> AvifResult<()> {
+    fn validate_image_grid(grid: &Grid, images: &[&Image], recipe: Recipe) -> AvifResult<()> {
         let first_image = images[0];
         let last_image = images.last().unwrap();
         for (index, image) in images.iter().enumerate() {
-            if image.depth != 8 && image.depth != 10 && image.depth != 12 {
-                return Err(AvifError::InvalidArgument);
+            if !matches!(
+                (image.depth, recipe),
+                (8 | 10 | 12, Recipe::None) | (16, Recipe::BitDepthExtension8b8b)
+            ) {
+                return AvifError::invalid_argument();
             }
             let expected_width = if grid.is_last_column(index as u32) {
                 last_image.width
@@ -361,23 +408,19 @@ impl Encoder {
                 || image.has_alpha() != first_image.has_alpha()
                 || image.alpha_premultiplied != first_image.alpha_premultiplied
             {
-                return Err(AvifError::InvalidImageGrid(
-                    "all cells do not have the same properties".into(),
-                ));
+                return AvifError::invalid_image_grid("all cells do not have the same properties");
             }
             if image.matrix_coefficients == MatrixCoefficients::Identity
                 && image.yuv_format != PixelFormat::Yuv444
             {
-                return Err(AvifError::InvalidArgument);
+                return AvifError::invalid_argument();
             }
             if !image.has_plane(Plane::Y) {
-                return Err(AvifError::NoContent);
+                return AvifError::no_content();
             }
         }
         if last_image.width > first_image.width || last_image.height > first_image.height {
-            return Err(AvifError::InvalidImageGrid(
-                "last cell was larger than the first cell".into(),
-            ));
+            return AvifError::invalid_image_grid("last cell was larger than the first cell");
         }
         if images.len() > 1 {
             validate_grid_image_dimensions(first_image, grid)?;
@@ -386,7 +429,7 @@ impl Encoder {
             if !CropRect::create_from(clap, grid.width, grid.height, first_image.yuv_format)?
                 .is_valid(grid.width, grid.height, first_image.yuv_format)
             {
-                return Err(AvifError::InvalidArgument);
+                return AvifError::invalid_argument();
             }
         }
         Ok(())
@@ -395,23 +438,23 @@ impl Encoder {
     fn validate_gainmap_grid(grid: &Grid, gainmaps: &[&GainMap]) -> AvifResult<()> {
         for gainmap in &gainmaps[1..] {
             if gainmaps[0] != *gainmap {
-                return Err(AvifError::InvalidImageGrid(
-                    "all cells should have the same gain map metadata".into(),
-                ));
+                return AvifError::invalid_image_grid(
+                    "all cells should have the same gain map metadata",
+                );
             }
         }
         if gainmaps[0].image.color_primaries != ColorPrimaries::Unspecified
             || gainmaps[0].image.transfer_characteristics != TransferCharacteristics::Unspecified
         {
-            return Err(AvifError::InvalidArgument);
+            return AvifError::invalid_argument();
         }
         let gainmap_images: Vec<_> = gainmaps.iter().map(|x| &x.image).collect();
-        Self::validate_image_grid(grid, &gainmap_images)?;
+        Self::validate_image_grid(grid, &gainmap_images, Recipe::None)?;
         // Ensure that the gainmap image does not have alpha. validate_image_grid() ensures that
         // either all the cell images have alpha or all of them don't. So it is sufficient to check
         // if the first cell image does not have alpha.
         if gainmap_images[0].has_alpha() {
-            return Err(AvifError::InvalidArgument);
+            return AvifError::invalid_argument();
         }
         Ok(())
     }
@@ -427,13 +470,19 @@ impl Encoder {
     ) -> AvifResult<()> {
         let cell_count: usize = usize_from_u32(grid_rows * grid_columns)?;
         if cell_count == 0 || cell_images.len() != cell_count {
-            return Err(AvifError::InvalidArgument);
+            return AvifError::invalid_argument();
         }
         if duration == 0 {
             duration = 1;
         }
+        let first_image = cell_images[0];
+        let final_recipe = self
+            .settings
+            .recipe
+            .self_or_auto_choose_depending_on(first_image);
         if self.items.is_empty() {
-            let first_image = cell_images[0];
+            assert!(self.final_recipe.is_none());
+            self.final_recipe = Some(final_recipe);
             let last_image = cell_images.last().unwrap();
             let grid = Grid {
                 rows: grid_rows,
@@ -441,15 +490,15 @@ impl Encoder {
                 width: (grid_columns - 1) * first_image.width + last_image.width,
                 height: (grid_rows - 1) * first_image.height + last_image.height,
             };
-            Self::validate_image_grid(&grid, cell_images)?;
+            Self::validate_image_grid(&grid, cell_images, final_recipe)?;
             self.image_metadata = first_image.shallow_clone();
-            if gainmaps.is_some() {
-                self.gainmap_image_metadata = gainmaps.unwrap()[0].image.shallow_clone();
-                self.copy_alt_image_metadata(gainmaps.unwrap()[0], &grid);
+            if let Some(gainmaps) = gainmaps {
+                self.gainmap_image_metadata = gainmaps[0].image.shallow_clone();
+                self.copy_alt_image_metadata(gainmaps[0], &grid);
             }
-            let color_item_id = self.add_items(&grid, Category::Color)?;
+            let color_item_id = self.add_items(&grid, Category::Color, /*hidden=*/ false)?;
             self.primary_item_id = color_item_id;
-            self.alpha_present = first_image.has_plane(Plane::A)
+            self.alpha_present = first_image.has_alpha()
                 && if is_single_image {
                     // When encoding a single image in which the alpha plane exists but is entirely
                     // opaque, skip writing an alpha AV1 payload. This does not apply to image
@@ -459,8 +508,9 @@ impl Encoder {
                     true
                 };
 
-            if self.alpha_present {
-                let alpha_item_id = self.add_items(&grid, Category::Alpha)?;
+            if self.alpha_present && !self.settings.codec_supports_native_alpha_channel() {
+                let alpha_item_id =
+                    self.add_items(&grid, Category::Alpha, /*hidden=*/ false)?;
                 let alpha_item = &mut self.items[alpha_item_id as usize - 1];
                 alpha_item.iref_type = Some(String::from("auxl"));
                 alpha_item.iref_to_id = Some(color_item_id);
@@ -472,9 +522,7 @@ impl Encoder {
             }
             if let Some(gainmaps) = gainmaps {
                 if gainmaps.len() != cell_images.len() {
-                    return Err(AvifError::InvalidImageGrid(
-                        "invalid number of gainmap images".into(),
-                    ));
+                    return AvifError::invalid_image_grid("invalid number of gainmap images");
                 }
                 let first_gainmap_image = &gainmaps[0].image;
                 let last_gainmap_image = &gainmaps.last().unwrap().image;
@@ -489,20 +537,36 @@ impl Encoder {
                 Self::validate_gainmap_grid(&gainmap_grid, gainmaps)?;
                 let tonemap_item_id = self.add_tmap_item(gainmaps[0])?;
                 if !self.alternative_item_ids.is_empty() {
-                    return Err(AvifError::UnknownError("".into()));
+                    return AvifError::unknown_error("");
                 }
                 self.alternative_item_ids.push(tonemap_item_id);
                 self.alternative_item_ids.push(color_item_id);
-                let gainmap_item_id = self.add_items(&gainmap_grid, Category::Gainmap)?;
+                let gainmap_item_id =
+                    self.add_items(&gainmap_grid, Category::Gainmap, /*hidden=*/ true)?;
                 for item_id in [color_item_id, gainmap_item_id] {
                     self.items[item_id as usize - 1].dimg_from_id = Some(tonemap_item_id);
                 }
             }
+
+            match final_recipe {
+                Recipe::Auto => unreachable!(),
+                Recipe::None => {}
+                Recipe::BitDepthExtension8b8b => {
+                    if first_image.depth != 16 {
+                        return AvifError::invalid_argument();
+                    }
+                    if gainmaps.is_some() {
+                        return AvifError::not_implemented();
+                    }
+                    self.create_bit_depth_extension_items(&grid)?;
+                }
+            }
+
             self.add_exif_item()?;
             self.add_xmp_item()?;
         } else {
             if gainmaps.is_some() {
-                return Err(AvifError::NotImplemented);
+                return AvifError::not_implemented();
             }
             // Another frame in an image sequence, or layer in a layered image.
             let first_image = cell_images[0];
@@ -513,7 +577,10 @@ impl Encoder {
                 // of the current image in that case.
                 || (self.image_metadata.alpha_present && !first_image.alpha_present)
             {
-                return Err(AvifError::InvalidArgument);
+                return AvifError::invalid_argument();
+            }
+            if self.final_recipe != Some(final_recipe) {
+                return AvifError::invalid_argument();
             }
         }
 
@@ -537,14 +604,39 @@ impl Encoder {
             };
             let mut padded_image;
             if image.width != first_image.width || image.height != first_image.height {
+                // Pad the right-most and/or bottom-most tiles so that all tiles share the same dimensions.
                 padded_image = first_image.shallow_clone();
                 padded_image.copy_and_pad(image)?;
                 image = &padded_image;
             }
+            let mut quality = match item.category {
+                Category::Color => self.settings.mutable.quality,
+                Category::Alpha => self.settings.mutable.quality_alpha,
+                Category::Gainmap => self.settings.mutable.quality_gainmap,
+            };
+
+            // If used, contains the most or least significiant bits of the image.
+            let bit_depth_extension_image;
+            match final_recipe {
+                Recipe::Auto => unreachable!(),
+                Recipe::None => assert!(!item.is_sato_least_significant_input),
+                Recipe::BitDepthExtension8b8b => {
+                    if !item.is_sato_least_significant_input {
+                        // Encoding the least significant bits of a sample does not
+                        // make any sense if the other bits are lossily compressed.
+                        // Encode the most significant bits losslessly.
+                        quality = 100.0;
+                    }
+                    bit_depth_extension_image =
+                        Self::create_bit_depth_extension_image(image, item)?;
+                    image = &bit_depth_extension_image;
+                }
+            }
+
             let encoder_config = EncoderConfig {
                 tile_rows_log2,
                 tile_columns_log2,
-                quantizer: self.settings.quantizer(item.category),
+                quality,
                 disable_lagged_output: self.alpha_present,
                 is_single_image,
                 speed: self.settings.speed,
@@ -577,7 +669,7 @@ impl Encoder {
 
     pub fn add_image_for_sequence(&mut self, image: &Image, duration: u64) -> AvifResult<()> {
         if self.settings.extra_layer_count != 0 {
-            return Err(AvifError::InvalidArgument);
+            return AvifError::invalid_argument();
         }
         // TODO: this and add_image cannot be used on the same instance.
         self.add_image_impl(1, 1, &[image], duration, false, None)
@@ -590,7 +682,7 @@ impl Encoder {
         images: &[&Image],
     ) -> AvifResult<()> {
         if grid_columns == 0 || grid_columns > 256 || grid_rows == 0 || grid_rows > 256 {
-            return Err(AvifError::InvalidImageGrid("".into()));
+            return AvifError::invalid_image_grid("");
         }
         self.add_image_impl(
             grid_columns,
@@ -604,7 +696,7 @@ impl Encoder {
 
     pub fn add_image_gainmap(&mut self, image: &Image, gainmap: &GainMap) -> AvifResult<()> {
         if self.settings.extra_layer_count != 0 {
-            return Err(AvifError::NotImplemented);
+            return AvifError::not_implemented();
         }
         self.add_image_impl(1, 1, &[image], 0, true, Some(&[gainmap]))
     }
@@ -617,17 +709,17 @@ impl Encoder {
         gainmaps: &[&GainMap],
     ) -> AvifResult<()> {
         if grid_columns == 0 || grid_columns > 256 || grid_rows == 0 || grid_rows > 256 {
-            return Err(AvifError::InvalidImageGrid("".into()));
+            return AvifError::invalid_image_grid("");
         }
         if self.settings.extra_layer_count != 0 {
-            return Err(AvifError::NotImplemented);
+            return AvifError::not_implemented();
         }
         self.add_image_impl(grid_columns, grid_rows, images, 0, true, Some(gainmaps))
     }
 
     pub fn finish(&mut self) -> AvifResult<Vec<u8>> {
         if self.items.is_empty() {
-            return Err(AvifError::NoContent);
+            return AvifError::no_content();
         }
         for item in &mut self.items {
             if item.codec.is_none() {
@@ -637,20 +729,38 @@ impl Encoder {
             if item.extra_layer_count > 0
                 && item.samples.len() != 1 + item.extra_layer_count as usize
             {
-                return Err(AvifError::InvalidArgument);
+                return AvifError::invalid_argument();
             }
             // TODO: check if sample count == duration count.
 
             if !item.samples.is_empty() {
-                // Harvest codec configuration from sequence header.
-                let sequence_header = Av1SequenceHeader::parse_from_obus(&item.samples[0].data)?;
-                item.codec_configuration = CodecConfiguration::Av1(sequence_header.config);
+                match self.settings.codec_choice {
+                    CodecChoice::Auto | CodecChoice::Aom => {
+                        // Harvest codec configuration from AV1 sequence header.
+                        let sequence_header =
+                            Av1SequenceHeader::parse_from_obus(&item.samples[0].data)?;
+                        item.codec_configuration = CodecConfiguration::Av1(sequence_header.config);
+                    }
+                    CodecChoice::MediaCodec | CodecChoice::Dav1d | CodecChoice::Libgav1 => {
+                        return AvifError::no_codec_available()
+                    }
+                }
             }
         }
         let mut stream = OStream::default();
+
+        if self.settings.header_format == HeaderFormat::Mini && mini::is_mini_compatible(self) {
+            self.write_ftyp_and_mini(&mut stream)?;
+            return Ok(stream.data);
+        }
+
         self.write_ftyp(&mut stream)?;
         self.write_meta(&mut stream)?;
-        self.write_moov(&mut stream)?;
+        self.write_moov(
+            &mut stream,
+            self.settings.creation_time,
+            self.settings.modification_time,
+        )?;
         self.write_mdat(&mut stream)?;
         Ok(stream.data)
     }

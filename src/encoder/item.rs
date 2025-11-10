@@ -15,6 +15,7 @@
 use crate::encoder::*;
 use crate::internal_utils::stream::*;
 use crate::utils::clap::CleanAperture;
+use crate::utils::pixels::ChannelIdc;
 use crate::*;
 
 #[derive(Default)]
@@ -22,6 +23,9 @@ pub(crate) struct Item {
     pub id: u16,
     pub item_type: String,
     pub category: Category,
+    // True if Sample Transforms derived image item input used as the least
+    // significant bits of the bit depth extension.
+    pub is_sato_least_significant_input: bool,
     pub codec: Option<Codec>,
     pub samples: Vec<Sample>,
     pub codec_configuration: CodecConfiguration,
@@ -56,15 +60,23 @@ impl fmt::Debug for Item {
 
 impl Item {
     pub(crate) fn has_ipma(&self) -> bool {
-        self.grid.is_some() || self.codec.is_some() || self.is_tmap()
+        self.grid.is_some() || self.codec.is_some() || self.is_tmap() || self.is_sato()
     }
 
     pub(crate) fn is_metadata(&self) -> bool {
-        self.item_type != "av01"
+        match self.item_type.as_str() {
+            "av01" => false,
+            "hvc1" => false, // Should not happen.
+            _ => true,
+        }
     }
 
     pub(crate) fn is_tmap(&self) -> bool {
         self.item_type == "tmap"
+    }
+
+    pub(crate) fn is_sato(&self) -> bool {
+        self.item_type == "sato"
     }
 
     pub(crate) fn write_ispe(
@@ -92,53 +104,134 @@ impl Item {
         &mut self,
         stream: &mut OStream,
         image_metadata: &Image,
+        force_write_extended_pixi: bool,
+        codec_supports_native_alpha_channel: bool,
     ) -> AvifResult<()> {
-        stream.start_full_box("pixi", (0, 0))?;
-        let num_channels = if self.category == Category::Alpha {
+        stream.start_full_box("pixi", (0, if force_write_extended_pixi { 1 } else { 0 }))?;
+        let num_color_channels = if self.category == Category::Alpha {
             1
         } else {
             image_metadata.yuv_format.plane_count() as u8
         };
+        let has_native_alpha_channel = self.category == Category::Color
+            && image_metadata.alpha_present
+            && codec_supports_native_alpha_channel;
+        let num_channels = num_color_channels + if has_native_alpha_channel { 1 } else { 0 };
         // unsigned int (8) num_channels;
         stream.write_u8(num_channels)?;
         for _ in 0..num_channels {
             // unsigned int (8) bits_per_channel;
             stream.write_u8(image_metadata.depth)?;
         }
+        if force_write_extended_pixi {
+            // See ISO/IEC 23008-12 DAM 2.
+            for i in 0..num_color_channels {
+                let channel_idc = match self.category {
+                    Category::Color | Category::Gainmap => {
+                        ChannelIdc::FirstColorChannel as u32 + i as u32
+                    }
+                    Category::Alpha => ChannelIdc::Alpha as u32,
+                };
+                stream.write_bits(channel_idc, 3)?; // unsigned int(3) channel_idc;
+                stream.write_bits(0, 1)?; // unsigned int(1) reserved;
+
+                // 0 means unsigned int samples.
+                stream.write_bits(0, 2)?; // unsigned int(2) component_format;
+
+                let subsampling_type = match (self.category, i) {
+                    (Category::Color | Category::Gainmap | Category::Alpha, 0) => 0, // 4:4:4
+                    (Category::Color | Category::Gainmap, 1 | 2) => {
+                        match image_metadata.yuv_format {
+                            PixelFormat::Yuv444 => 0,
+                            PixelFormat::Yuv422 => 1,
+                            PixelFormat::Yuv420 => 2,
+                            _ => unreachable!(),
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                let subsampling_location = match (self.category, i) {
+                    (Category::Color | Category::Gainmap | Category::Alpha, 0) => Some(0),
+                    (Category::Color | Category::Gainmap, 1 | 2) => {
+                        match (image_metadata.chroma_sample_position, subsampling_type) {
+                            (ChromaSamplePosition::Unknown, 0) => Some(2), // 4:4:4 so (0, 0) is fine
+                            (ChromaSamplePosition::Unknown, _) => None,
+                            (ChromaSamplePosition::Vertical, _) => Some(0), // (0, 0.5)
+                            (ChromaSamplePosition::Colocated, _) => Some(2), // (0, 0)
+                            _ => unreachable!(),
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                if let Some(subsampling_location) = subsampling_location {
+                    stream.write_bits(1, 1)?; // unsigned int(1) subsampling_flag;
+                    stream.write_bits(0, 1)?; // unsigned int(1) channel_label_flag;
+                    stream.write_bits(subsampling_type, 4)?; // unsigned int(4) subsampling_type;
+                    stream.write_bits(subsampling_location, 4)?; // unsigned int(4) subsampling_location;
+                } else {
+                    // subsampling_location is unknown, better not signal it.
+                    stream.write_bits(0, 1)?; // unsigned int(1) subsampling_flag;
+                    stream.write_bits(0, 1)?; // unsigned int(1) channel_label_flag;
+                }
+            }
+
+            if self.category == Category::Color
+                && image_metadata.alpha_present
+                && codec_supports_native_alpha_channel
+            {
+                // Assume the alpha channel to be last (RGBA, YUVA).
+                stream.write_bits(ChannelIdc::Alpha as u32, 3)?; // unsigned int(3) channel_idc;
+                stream.write_bits(0, 1)?; // unsigned int(1) reserved;
+                stream.write_bits(0, 2)?; // unsigned int(2) component_format;
+                stream.write_bits(0, 1)?; // unsigned int(1) subsampling_flag;
+                stream.write_bits(0, 1)?; // unsigned int(1) channel_label_flag;
+            }
+        }
         stream.finish_box()
     }
 
-    pub(crate) fn write_codec_config(&self, stream: &mut OStream) -> AvifResult<()> {
-        if let CodecConfiguration::Av1(config) = &self.codec_configuration {
-            stream.start_box("av1C")?;
-            // unsigned int (1) marker = 1;
-            stream.write_bits(1, 1)?;
-            // unsigned int (7) version = 1;
-            stream.write_bits(1, 7)?;
-            // unsigned int(3) seq_profile;
-            stream.write_bits(config.seq_profile, 3)?;
-            // unsigned int(5) seq_level_idx_0;
-            stream.write_bits(config.seq_level_idx0, 5)?;
-            // unsigned int(1) seq_tier_0;
-            stream.write_bits(config.seq_tier0, 1)?;
-            // unsigned int(1) high_bitdepth;
-            stream.write_bits(config.high_bitdepth as u8, 1)?;
-            // unsigned int(1) twelve_bit;
-            stream.write_bits(config.twelve_bit as u8, 1)?;
-            // unsigned int(1) monochrome;
-            stream.write_bits(config.monochrome as u8, 1)?;
-            // unsigned int(1) chroma_subsampling_x;
-            stream.write_bits(config.chroma_subsampling_x, 1)?;
-            // unsigned int(1) chroma_subsampling_y;
-            stream.write_bits(config.chroma_subsampling_y, 1)?;
-            // unsigned int(2) chroma_sample_position;
-            stream.write_bits(config.chroma_sample_position as u8, 2)?;
-            // unsigned int (3) reserved = 0;
-            // unsigned int (1) initial_presentation_delay_present;
-            // unsigned int (4) reserved = 0;
-            stream.write_u8(0)?;
-            stream.finish_box()?;
+    pub(crate) fn write_codec_config_box(&self, stream: &mut OStream) -> AvifResult<()> {
+        match &self.codec_configuration {
+            CodecConfiguration::Av1(config) => {
+                stream.start_box("av1C")?;
+                Self::write_av1_codec_config(config, stream)?;
+                stream.finish_box()?;
+            }
+            CodecConfiguration::Hevc(_) => unreachable!(),
         }
+        Ok(())
+    }
+
+    pub(crate) fn write_av1_codec_config(
+        config: &Av1CodecConfiguration,
+        stream: &mut OStream,
+    ) -> AvifResult<()> {
+        // unsigned int (1) marker = 1;
+        stream.write_bits(1, 1)?;
+        // unsigned int (7) version = 1;
+        stream.write_bits(1, 7)?;
+        // unsigned int(3) seq_profile;
+        stream.write_bits(config.seq_profile.into(), 3)?;
+        // unsigned int(5) seq_level_idx_0;
+        stream.write_bits(config.seq_level_idx0.into(), 5)?;
+        // unsigned int(1) seq_tier_0;
+        stream.write_bits(config.seq_tier0.into(), 1)?;
+        // unsigned int(1) high_bitdepth;
+        stream.write_bool(config.high_bitdepth)?;
+        // unsigned int(1) twelve_bit;
+        stream.write_bool(config.twelve_bit)?;
+        // unsigned int(1) monochrome;
+        stream.write_bool(config.monochrome)?;
+        // unsigned int(1) chroma_subsampling_x;
+        stream.write_bits(config.chroma_subsampling_x.into(), 1)?;
+        // unsigned int(1) chroma_subsampling_y;
+        stream.write_bits(config.chroma_subsampling_y.into(), 1)?;
+        // unsigned int(2) chroma_sample_position;
+        stream.write_bits(config.chroma_sample_position as u32, 2)?;
+        // unsigned int (3) reserved = 0;
+        // unsigned int (1) initial_presentation_delay_present;
+        // unsigned int (4) reserved = 0;
+        stream.write_u8(0)?;
         Ok(())
     }
 
@@ -160,7 +253,7 @@ impl Item {
         // unsigned int(7) reserved = 0;
         stream.write_bits(0, 7)?;
         // unsigned int(1) large_size;
-        stream.write_bits(has_large_size as u8, 1)?;
+        stream.write_bool(has_large_size)?;
         // FieldLength = (large_size + 1) * 16;
         // unsigned int(FieldLength) layer_size[3];
         for i in 0..3 {
@@ -238,7 +331,7 @@ impl Item {
         // unsigned int(6) reserved = 0;
         stream.write_bits(0, 6)?;
         // unsigned int(2) angle;
-        stream.write_bits(angle & 0x03, 2)?;
+        stream.write_bits((angle & 0x03).into(), 2)?;
         stream.finish_box()
     }
 
@@ -247,7 +340,7 @@ impl Item {
         // unsigned int(7) reserved = 0;
         stream.write_bits(0, 7)?;
         // unsigned int(1) axis;
-        stream.write_bits(axis & 0x01, 1)?;
+        stream.write_bits((axis & 0x01).into(), 1)?;
         stream.finish_box()
     }
 
@@ -293,6 +386,8 @@ impl Item {
         image_metadata: &Image,
         item_metadata: &Image,
         streams: &mut Vec<OStream>,
+        force_write_extended_pixi: bool,
+        codec_supports_native_alpha_channel: bool,
     ) -> AvifResult<()> {
         if !self.has_ipma() {
             return Ok(());
@@ -305,13 +400,18 @@ impl Item {
 
         // TODO: check for is_tmap and alt_plane_depth.
         streams.push(OStream::default());
-        self.write_pixi(streams.last_mut().unwrap(), item_metadata)?;
+        self.write_pixi(
+            streams.last_mut().unwrap(),
+            item_metadata,
+            force_write_extended_pixi,
+            codec_supports_native_alpha_channel,
+        )?;
         self.associations
             .push((u8_from_usize(streams.len())?, false));
 
         if self.codec.is_some() {
             streams.push(OStream::default());
-            self.write_codec_config(streams.last_mut().unwrap())?;
+            self.write_codec_config_box(streams.last_mut().unwrap())?;
             self.associations
                 .push((u8_from_usize(streams.len())?, true));
         }
@@ -321,6 +421,7 @@ impl Item {
                 // Color properties.
                 // Note the 'tmap' item when a gain map is present also has category set to
                 // Category::Color.
+                // Note a derived 'grid' or 'sato' item can have any category.
                 if !item_metadata.icc.is_empty() {
                     streams.push(OStream::default());
                     self.write_icc(streams.last_mut().unwrap(), item_metadata)?;
@@ -344,7 +445,6 @@ impl Item {
                     self.associations
                         .push((u8_from_usize(streams.len())?, false));
                 }
-                self.write_transformative_properties(streams, item_metadata)?;
             }
             Category::Alpha => {
                 streams.push(OStream::default());
@@ -363,16 +463,11 @@ impl Item {
                     self.associations
                         .push((u8_from_usize(streams.len())?, false));
                 }
-                if item_metadata.clap.is_some()
-                    || item_metadata.irot_angle.is_some()
-                    || item_metadata.imir_axis.is_some()
-                    || item_metadata.pasp.is_some()
-                {
-                    return Err(AvifError::UnknownError(
-                        "transformative properties must be associated with the base image".into(),
-                    ));
+                if item_metadata.pasp.is_some() {
+                    return AvifError::unknown_error(
+                        "pixel aspect ratio property must be associated with the base image",
+                    );
                 }
-                self.write_transformative_properties(streams, image_metadata)?;
             }
         }
         if self.extra_layer_count > 0 {
@@ -383,6 +478,28 @@ impl Item {
             // We don't write 'lsel' property since many decoders do not support it and will reject
             // the image, see https://github.com/AOMediaCodec/libavif/pull/2429
         }
+        // ISO/IEC 23008-12 (HEIF), Section 6.5.1:
+        //   Readers shall allow and ignore descriptive properties following the first
+        //   transformative or unrecognized property, whichever is earlier, in the sequence
+        //   associating properties with an item.
+        //   Writers should arrange the descriptive properties specified in 6.5 prior to
+        //   any other properties in the sequence associating properties with an item.
+        match self.category {
+            Category::Color | Category::Alpha => {
+                self.write_transformative_properties(streams, item_metadata)?;
+            }
+            Category::Gainmap => {
+                if item_metadata.clap.is_some()
+                    || item_metadata.irot_angle.is_some()
+                    || item_metadata.imir_axis.is_some()
+                {
+                    return AvifError::unknown_error(
+                        "transformative properties must be associated with the base image",
+                    );
+                }
+                self.write_transformative_properties(streams, image_metadata)?;
+            }
+        }
         Ok(())
     }
 
@@ -391,13 +508,14 @@ impl Item {
         stream: &mut OStream,
         image_metadata: &Image,
         duration: u64,
-        timestamp: u64,
+        creation_time: u64,
+        modification_time: u64,
     ) -> AvifResult<()> {
         stream.start_full_box("tkhd", (1, 1))?;
         // unsigned int(64) creation_time;
-        stream.write_u64(timestamp)?;
+        stream.write_u64(creation_time)?;
         // unsigned int(64) modification_time;
-        stream.write_u64(timestamp)?;
+        stream.write_u64(modification_time)?;
         // unsigned int(32) track_ID;
         stream.write_u32(self.id as u32)?;
         // const unsigned int(32) reserved = 0;
@@ -521,7 +639,10 @@ impl Item {
         // unsigned int(32) entry_count;
         stream.write_u32(1)?;
         {
-            stream.start_box("av01")?;
+            stream.start_box(match self.codec_configuration {
+                CodecConfiguration::Av1(_) => "av01",
+                CodecConfiguration::Hevc(_) => unreachable!(),
+            })?;
             // const unsigned int(8)[6] reserved = 0;
             for _ in 0..6 {
                 stream.write_u8(0)?;
@@ -557,7 +678,7 @@ impl Item {
             // int(16) pre_defined = -1
             stream.write_u16(0xffff)?;
 
-            self.write_codec_config(stream)?;
+            self.write_codec_config_box(stream)?;
             if self.category == Category::Color {
                 self.write_icc(stream, image_metadata)?;
                 self.write_nclx(stream, image_metadata)?;
