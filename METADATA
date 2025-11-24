@@ -9,13 +9,13 @@ third_party {
   last_upgrade_date {
     year: 2025
     month: 11
-    day: 11
+    day: 19
   }
   homepage: "https://github.com/webmproject/CrabbyAvif"
   identifier {
     type: "Git"
     value: "https://github.com/webmproject/CrabbyAvif.git"
-    version: "640d2758f8d2e59d1a55ae0933673f0f65de68c4"
+    version: "2f72e0c981abca09c2244f5c3ff284ba677b13dc"
     primary_source: true
   }
 }
