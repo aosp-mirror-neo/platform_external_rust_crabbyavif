@@ -204,7 +204,9 @@ impl IStream<'_> {
     ) -> AvifResult<(u8, u32)> {
         let (version, flags) = self.read_version_and_flags()?;
         if version != enforced_version {
-            return AvifError::bmff_parse_failed("");
+            return AvifError::bmff_parse_failed(format!(
+                "Unexpected box version {version} instead of {enforced_version}"
+            ));
         }
         Ok((version, flags))
     }
@@ -306,6 +308,36 @@ impl IStream<'_> {
             self.skip_bits(leading_zeros as usize)?; // f(leadingZeros) value;
         }
         Ok(())
+    }
+
+    #[cfg(feature = "avm")]
+    // Variable Length Coding.
+    pub(crate) fn read_uvlc(&mut self) -> AvifResult<u32> {
+        let mut num_bits = 0;
+        while !self.read_bool()? {
+            num_bits += 1;
+            if num_bits == 32 {
+                return Ok(0xFFFFFFFF);
+            }
+        }
+        Ok(if num_bits != 0 {
+            ((1 << num_bits) - 1) + self.read_bits(num_bits)?
+        } else {
+            0
+        })
+    }
+
+    #[cfg(feature = "avm")]
+    // Rice-Golomb coding with parameter n.
+    pub(crate) fn read_rg(&mut self, n: u32) -> AvifResult<u32> {
+        for q in 0..32 {
+            let rg_bit = self.read_bit()?;
+            if rg_bit == 0 {
+                let remainder = self.read_bits(n as usize)?;
+                return Ok((q << n) + remainder);
+            }
+        }
+        Ok(0xFFFFFFFF)
     }
 }
 

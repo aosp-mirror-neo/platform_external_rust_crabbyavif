@@ -237,6 +237,32 @@ fn keyframes() {
     assert_eq!(decoder.nearest_keyframe(15), 3);
 }
 
+#[test]
+fn animated_image_with_unsupported_hdlr() {
+    // The handler in meta box is valid. So this should parse successfully when source is set to
+    // primary item.
+    let mut decoder = get_decoder("colors-animated-8bpc-unsupported-hdlr-moov.avif");
+    decoder.settings.source = decoder::Source::PrimaryItem;
+    let res = decoder.parse();
+    assert!(res.is_ok());
+
+    // The handler in moov box is invalid. So this should fail to parse when source is set to
+    // tracks.
+    let mut decoder = get_decoder("colors-animated-8bpc-unsupported-hdlr-moov.avif");
+    decoder.settings.source = decoder::Source::Tracks;
+    let res = decoder.parse();
+    assert!(res.is_err());
+
+    // The handler in meta box is invalid. So this should fail to parse irrespective of which
+    // source is requested.
+    for source in [decoder::Source::PrimaryItem, decoder::Source::Tracks] {
+        let mut decoder = get_decoder("colors-animated-8bpc-unsupported-hdlr-meta.avif");
+        decoder.settings.source = source;
+        let res = decoder.parse();
+        assert!(res.is_err());
+    }
+}
+
 // From avifdecodetest.cc
 #[test]
 fn color_grid_alpha_no_grid() {
@@ -532,6 +558,32 @@ fn gainmap_oriented() {
     assert!(decoder.gainmap_present());
     assert_eq!(decoder.gainmap().image.irot_angle, None);
     assert_eq!(decoder.gainmap().image.imir_axis, None);
+}
+
+#[test_matrix(
+    [
+        ("gainmap_oriented.avif", 34),
+        ("color_grid_gainmap_different_grid.avif", 600)
+    ],
+    [ImageContentType::ColorAndAlpha, ImageContentType::GainMap, ImageContentType::All]
+)]
+fn decoded_row_count(
+    filename_and_row_count: (&str, u32),
+    image_content_to_decode: ImageContentType,
+) {
+    let filename = filename_and_row_count.0;
+    let expected_row_count = filename_and_row_count.1;
+    let mut decoder = get_decoder(filename);
+    decoder.settings.image_content_to_decode = image_content_to_decode;
+    let res = decoder.parse();
+    assert!(res.is_ok());
+    assert!(decoder.gainmap_present());
+    if !HAS_DECODER {
+        return;
+    }
+    let res = decoder.next_image();
+    assert!(res.is_ok());
+    assert_eq!(decoder.decoded_row_count(), expected_row_count);
 }
 
 // From avifgainmaptest.cc

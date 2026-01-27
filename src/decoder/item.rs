@@ -342,6 +342,11 @@ impl Item {
     }
 
     #[cfg(feature = "jpegxl")]
+    pub(crate) fn alpi(&self) -> Option<&AlphaInformation> {
+        find_property!(self.properties, AlphaInformation)
+    }
+
+    #[cfg(feature = "jpegxl")]
     pub(crate) fn colr_nclx(&self) -> Option<&Nclx> {
         for property in &self.properties {
             if let ItemProperty::ColorInformation(ColorInformation::Nclx(nclx)) = property {
@@ -372,6 +377,8 @@ impl Item {
     pub(crate) fn is_image_codec_item(&self) -> bool {
         [
             "av01",
+            #[cfg(feature = "avm")]
+            "av02",
             #[cfg(feature = "heic")]
             "hvc1",
             #[cfg(feature = "jpegxl")]

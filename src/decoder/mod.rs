@@ -29,6 +29,9 @@ use crate::codecs::libgav1::Libgav1;
 #[cfg(feature = "android_mediacodec")]
 use crate::codecs::android_mediacodec::MediaCodec;
 
+#[cfg(feature = "avm")]
+use crate::codecs::avm::Avm;
+
 #[cfg(feature = "jpegxl")]
 use crate::codecs::libjxl::Libjxl;
 
@@ -80,6 +83,11 @@ impl CodecChoice {
                 CodecChoice::Auto | CodecChoice::Dav1d => Some(Box::<Dav1d>::default()),
                 #[cfg(feature = "libgav1")]
                 CodecChoice::Auto | CodecChoice::Libgav1 => Some(Box::<Libgav1>::default()),
+                _ => None,
+            },
+            #[cfg(feature = "avm")]
+            CompressionFormat::Avif2 => match self {
+                CodecChoice::Auto | CodecChoice::Avm => Some(Box::<Avm>::default()),
                 _ => None,
             },
             CompressionFormat::Heic => match self {
@@ -364,8 +372,10 @@ pub enum CompressionFormat {
     #[default]
     Avif = 0,
     Heic = 1,
+    #[cfg(feature = "avm")]
+    Avif2 = 2, // Future AV2-ISOBMFF with HEIF (experimental)
     #[cfg(feature = "jpegxl")]
-    JpegXl = 2,
+    JpegXl = 3,
 }
 
 pub(crate) struct GridImageHelper<'a> {
@@ -707,11 +717,20 @@ impl Decoder {
 
     fn harvest_cicp_from_sequence_header(&mut self) -> AvifResult<()> {
         let decoding_item = DecodingItem::COLOR;
+        let tile_index = 0;
         if self.tiles[decoding_item.usize()].is_empty() {
             return Ok(());
         }
+
+        // Only AV1 OBUs can be parsed for CICP values for now.
+        if !matches!(
+            self.tiles[decoding_item.usize()][tile_index].codec_config,
+            CodecConfiguration::Av1(_)
+        ) {
+            return Ok(());
+        }
+
         for search_size in (64..4096).step_by(64) {
-            let tile_index = 0;
             self.prepare_sample(
                 /*image_index=*/ 0,
                 decoding_item,
@@ -1394,8 +1413,9 @@ impl Decoder {
                         return AvifError::not_implemented();
                     }
                     self.image.alpha_present = true;
-                    // TODO: b/456440247 - Harvest alpha premultiplied from the new alpi box.
-                    self.image.alpha_premultiplied = false;
+                    self.image.alpha_premultiplied =
+                        find_property!(color_properties, AlphaInformation)
+                            .map_or(false, |alpi| alpi.is_premultiplied);
                 }
             }
 
@@ -2107,7 +2127,7 @@ impl Decoder {
     // returned AvifResult::Ok. Returns 0 in all other cases.
     pub fn decoded_row_count(&self) -> u32 {
         let mut min_row_count = self.image.height;
-        for decoding_item in DecodingItem::ALL {
+        for decoding_item in self.settings.image_content_to_decode.decoding_items() {
             let decoding_item_usize = decoding_item.usize();
             if self.tiles[decoding_item_usize].is_empty() {
                 continue;
