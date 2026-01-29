@@ -35,6 +35,9 @@ use crate::*;
 #[cfg(feature = "aom")]
 use crate::codecs::aom::Aom;
 
+#[cfg(feature = "avm")]
+use crate::codecs::avm::Avm;
+
 #[cfg(feature = "jpegxl")]
 use crate::codecs::libjxl::Libjxl;
 
@@ -149,6 +152,8 @@ impl CodecChoice {
             Self::Auto => unreachable!(),
             #[cfg(feature = "aom")]
             Self::Aom => Ok(("av01", Box::<Aom>::default())),
+            #[cfg(feature = "avm")]
+            Self::Avm => Ok(("av02", Box::<Avm>::default())),
             #[cfg(feature = "jpegxl")]
             Self::Libjxl => Ok(("hxlI", Box::<Libjxl>::default())),
             _ => AvifError::no_codec_available(),
@@ -754,10 +759,12 @@ impl Encoder {
 
             if !item.samples.is_empty() {
                 assert_eq!(item.codec_configuration, None);
+                let is_single_image = self.duration_in_timescales.len() < 2;
+                let is_lossless = self.settings.mutable.quality == 100.0;
                 item.codec_configuration = Some(item.codec.unwrap_ref().get_codec_config(
                     &self.image_metadata,
-                    self.duration_in_timescales.len() > 1,
-                    self.settings.mutable.quality == 100.0,
+                    is_single_image,
+                    is_lossless,
                     &item.samples,
                 )?);
             }

@@ -7,15 +7,15 @@ description: "CrabbyAvif is a rust library that is used for AVIF Image Decoding"
 third_party {
   license_type: NOTICE
   last_upgrade_date {
-    year: 2025
-    month: 12
-    day: 12
+    year: 2026
+    month: 1
+    day: 27
   }
   homepage: "https://github.com/webmproject/CrabbyAvif"
   identifier {
     type: "Git"
     value: "https://github.com/webmproject/CrabbyAvif.git"
-    version: "06197dd483dce896ca43a7dd27373eb206a6081a"
+    version: "908b36ca6195b3db6d8112e39405430b724377de"
     primary_source: true
   }
 }

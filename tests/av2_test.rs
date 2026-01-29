@@ -1,4 +1,4 @@
-// Copyright 2025 Google LLC
+// Copyright 2026 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![cfg(feature = "jpegxl")]
+#![cfg(feature = "avm")]
 
 use crabby_avif::decoder::CompressionFormat;
 use crabby_avif::image::*;
@@ -31,20 +31,23 @@ enum Alpha {
 }
 
 #[test_matrix(
-    [100, 121],
-    [200, 107],
-    [8], // TODO: b/456440247 - Support 16-bit
+    [1],
+    [1],
+    [8], // TODO: b/437292541 - Test 10-bit and 12-bit
+    [PixelFormat::Yuv420, PixelFormat::Yuv444],
+    [YuvRange::Limited, YuvRange::Full],
     [Alpha::None, Alpha::Unpremultiplied, Alpha::Premultiplied]
 )]
-fn encode_decode(width: u32, height: u32, depth: u8, alpha: Alpha) -> AvifResult<()> {
-    let mut image = generate_gradient_image(
-        width,
-        height,
-        depth,
-        PixelFormat::Yuv444,
-        YuvRange::Full,
-        alpha != Alpha::None,
-    )?;
+fn encode_decode(
+    width: u32,
+    height: u32,
+    depth: u8,
+    format: PixelFormat,
+    range: YuvRange,
+    alpha: Alpha,
+) -> AvifResult<()> {
+    let mut image =
+        generate_gradient_image(width, height, depth, format, range, alpha != Alpha::None)?;
     // This may result in invalid premultiplied color samples but CrabbyAvif
     // does not reject that for now.
     image.alpha_premultiplied = alpha == Alpha::Premultiplied;
@@ -52,8 +55,8 @@ fn encode_decode(width: u32, height: u32, depth: u8, alpha: Alpha) -> AvifResult
 
     let encoded = {
         let settings = encoder::Settings {
-            codec_choice: CodecChoice::Libjxl,
-            speed: Some(1), // Fastest libjxl setting.
+            codec_choice: CodecChoice::Avm,
+            speed: Some(9), // Fastest libavm setting.
             mutable: encoder::MutableSettings {
                 quality: 90.0,
                 quality_alpha: 90.0,
@@ -68,11 +71,11 @@ fn encode_decode(width: u32, height: u32, depth: u8, alpha: Alpha) -> AvifResult
     assert!(!encoded.is_empty());
 
     let mut decoder = decoder::Decoder::default();
-    // Explicitly selecting libjxl should not be necessary.
+    // Explicitly selecting libavm should not be necessary.
     decoder.settings.codec_choice = CodecChoice::Auto;
     decoder.set_io_vec(encoded);
     assert!(decoder.parse().is_ok());
-    assert_eq!(decoder.compression_format(), CompressionFormat::JpegXl);
+    assert_eq!(decoder.compression_format(), CompressionFormat::Avif2);
     assert_eq!(decoder.image_count(), 1);
 
     let decoded = decoder.image().unwrap();
@@ -94,3 +97,5 @@ fn encode_decode(width: u32, height: u32, depth: u8, alpha: Alpha) -> AvifResult
     assert!(psnr >= 50.0);
     Ok(())
 }
+
+// TODO: b/437292541 - Test image sequences
