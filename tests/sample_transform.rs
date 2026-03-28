@@ -33,9 +33,10 @@ fn lossless_sample_transform_roundtrip(recipe: Recipe) -> AvifResult<()> {
         return Ok(());
     }
     let input_file = get_test_file("weld_16bit.png");
-    let (image, _) = PngReader::create(&input_file)?.read_frame(&Config {
+    let (image, _, _) = PngReader::create(&input_file)?.read_frame(&Config {
         yuv_format: Some(PixelFormat::Yuv444),
         matrix_coefficients: Some(MatrixCoefficients::Identity),
+        allow_sample_transform: true,
         ..Default::default()
     })?;
     assert_eq!(image.depth, 16);

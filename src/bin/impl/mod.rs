@@ -219,6 +219,18 @@ struct CommandLineArgs {
     #[arg(long, short = 'q', value_parser = value_parser!(f32))]
     quality: Option<f32>,
 
+    /// AVIF Encode only: Output alpha channel quality in 0..100. (default: quality).
+    #[arg(long, value_parser = value_parser!(f32))]
+    quality_alpha: Option<f32>,
+
+    /// AVIF Encode only: Output gainmap quality in 0..100. (default: quality).
+    #[arg(long, value_parser = value_parser!(f32))]
+    quality_gainmap: Option<f32>,
+
+    /// PNG output compression level in 0..9 (default: 5).
+    #[arg(long, value_parser = value_parser!(i32).range(0..=9))]
+    png_compress: Option<i32>,
+
     /// AVIF Encode only: Speed used for encoding.
     #[arg(long, short = 's', value_parser = value_parser!(u32).range(0..=10))]
     speed: Option<u32>,
@@ -325,6 +337,19 @@ struct CommandLineArgs {
     /// 'infinite' for infinite repetitions. (Default: infinite)
     #[arg(long, default_value = "infinite", value_parser = repetition_count_parser)]
     repetition_count: RepetitionCount,
+
+    /// AVIF Decode only: Allow sample transform. (Default: false)
+    #[arg(long, default_value = "false")]
+    allow_sample_transform: bool,
+
+    /// AVIF Decode only: Decode and output only the gainmap.
+    #[arg(long, default_value = "false")]
+    extract_gainmap: bool,
+
+    /// AVIF Encode only: CLLI information of the alternate image. Only used when encoding an image
+    /// with gainmap. Ignored otherwise.
+    #[arg(long, value_parser = clli_parser)]
+    alt_clli: Option<ContentLightLevelInformation>,
 
     /// Input AVIF file
     #[arg(allow_hyphen_values = false)]
@@ -541,12 +566,17 @@ fn max_threads(jobs: &Option<u32>) -> u32 {
 fn create_decoder_and_parse(args: &CommandLineArgs, input_file: &String) -> AvifResult<Decoder> {
     let mut settings = decoder::Settings {
         strictness: if args.no_strict { Strictness::None } else { Strictness::All },
-        image_content_to_decode: ImageContentType::All,
+        image_content_to_decode: if args.extract_gainmap {
+            ImageContentType::GainMap
+        } else {
+            ImageContentType::All
+        },
         codec_choice: args.codec,
         max_threads: max_threads(&args.jobs),
         allow_progressive: args.progressive,
         ignore_exif: args.ignore_exif,
         ignore_xmp: args.ignore_xmp,
+        allow_sample_transform: args.allow_sample_transform,
         ..Default::default()
     };
     // These values cannot be initialized in the list above since we need the default values to be
@@ -640,7 +670,16 @@ fn decode(args: &CommandLineArgs, input_file: &String) -> AvifResult<()> {
     print_image_info(&decoder);
 
     let output_filename = &args.output_file.as_ref().unwrap().as_str();
-    let image = decoder.image().unwrap();
+    let image = if args.extract_gainmap {
+        if !decoder.gainmap_present() {
+            return Err(AvifError::UnknownError(
+                "Input image does not contain a gain map".into(),
+            ));
+        }
+        &decoder.gainmap().image
+    } else {
+        decoder.image().unwrap()
+    };
     let extension = get_extension(output_filename);
     let mut writer: Box<dyn Writer> = match extension.as_str() {
         "y4m" | "yuv" => {
@@ -650,7 +689,10 @@ fn decode(args: &CommandLineArgs, input_file: &String) -> AvifResult<()> {
             Box::new(Y4MWriter::create(extension == "yuv"))
         }
         #[cfg(feature = "png")]
-        "png" => Box::new(PngWriter { depth: args.depth }),
+        "png" => Box::new(PngWriter {
+            depth: args.depth,
+            compression_level: args.png_compress,
+        }),
         #[cfg(feature = "jpeg")]
         "jpg" | "jpeg" => Box::new(JpegWriter {
             quality: args.quality.map(|quality| quality as u8),
@@ -664,7 +706,23 @@ fn decode(args: &CommandLineArgs, input_file: &String) -> AvifResult<()> {
     let mut output_file = File::create(output_filename).or(Err(AvifError::UnknownError(
         "Could not open output file".into(),
     )))?;
-    writer.write_frame(&mut output_file, image)?;
+    let cropped_image = if image.clap.is_some() {
+        if let Ok(cropped_image) = image.cropped_image() {
+            Some(cropped_image)
+        } else {
+            println!("Warning: clap was invalid. So writing whole image.");
+            None
+        }
+    } else {
+        None
+    };
+    writer.write_frame(
+        &mut output_file,
+        match &cropped_image {
+            Some(cropped_image) => cropped_image,
+            None => image,
+        },
+    )?;
     println!(
         "Wrote image at index {} to output {}",
         args.index.unwrap_or(0),
@@ -702,11 +760,16 @@ fn encode(args: &CommandLineArgs, input_file: &str, output_file: &str) -> AvifRe
     let reader_config = Config {
         yuv_format: args.yuv_format,
         depth: args.depth,
+        allow_sample_transform: args.allow_sample_transform,
         ..Default::default()
     };
-    let (mut image, mut duration_ms) = reader.read_frame(&reader_config)?;
-    image.irot_angle = args.irot_angle;
-    image.imir_axis = args.imir_axis;
+    let (mut image, mut duration_ms, mut gainmap) = reader.read_frame(&reader_config)?;
+    if args.irot_angle.is_some() {
+        image.irot_angle = args.irot_angle;
+    }
+    if args.imir_axis.is_some() {
+        image.imir_axis = args.imir_axis;
+    }
     if let Some(clap) = args.clap {
         image.clap = Some(clap);
     }
@@ -734,6 +797,26 @@ fn encode(args: &CommandLineArgs, input_file: &str, output_file: &str) -> AvifRe
     if let Some(xmp) = &args.xmp {
         image.xmp = read_file(xmp).expect("failed to read xmp file");
     }
+    if image.icc.is_empty()
+        && args.cicp.is_none()
+        && image.color_primaries == ColorPrimaries::Unspecified
+        && image.transfer_characteristics == TransferCharacteristics::Unspecified
+    {
+        // The final image has no ICC profile, the user didn't specify any CICP, and the source
+        // image didn't provide any CICP. Explicitly signal SRGB CP/TC here, as 2/2/x will be
+        // interpreted as SRGB anyway.
+        image.color_primaries = ColorPrimaries::Srgb;
+        image.transfer_characteristics = TransferCharacteristics::Srgb;
+    }
+    if let Some(gainmap) = &mut gainmap {
+        if gainmap.alt_icc.is_empty() && gainmap.alt_color_primaries == ColorPrimaries::Unspecified
+        {
+            gainmap.alt_color_primaries = image.color_primaries;
+        }
+        if let Some(alt_clli) = args.alt_clli {
+            gainmap.alt_clli = alt_clli;
+        }
+    }
     let codec_choice = match args.codec {
         CodecChoice::Auto => match get_extension(output_file).as_str() {
             "avif" => CodecChoice::Auto, // CodecChoice::Auto maps to AV1 only. Keep it.
@@ -743,6 +826,7 @@ fn encode(args: &CommandLineArgs, input_file: &str, output_file: &str) -> AvifRe
         },
         explicit_codec_choice => explicit_codec_choice,
     };
+    let quality = args.quality.unwrap_or(DEFAULT_ENCODE_QUALITY);
     let mut settings = encoder::Settings {
         extra_layer_count: if args.progressive { 1 } else { 0 },
         codec_choice,
@@ -752,7 +836,9 @@ fn encode(args: &CommandLineArgs, input_file: &str, output_file: &str) -> AvifRe
         timescale: 1000, // ms.
         repetition_count: args.repetition_count,
         mutable: MutableSettings {
-            quality: args.quality.unwrap_or(DEFAULT_ENCODE_QUALITY),
+            quality,
+            quality_alpha: args.quality_alpha.unwrap_or(quality),
+            quality_gainmap: args.quality_gainmap.unwrap_or(quality),
             tiling_mode: if args.autotiling {
                 TilingMode::Auto
             } else {
@@ -782,7 +868,7 @@ fn encode(args: &CommandLineArgs, input_file: &str, output_file: &str) -> AvifRe
             if !reader.has_more_frames() {
                 break;
             }
-            (image, duration_ms) = reader.read_frame(&reader_config)?;
+            (image, duration_ms, _) = reader.read_frame(&reader_config)?;
         }
     } else if args.progressive {
         // Encode the base layer with very low quality.
@@ -793,6 +879,8 @@ fn encode(args: &CommandLineArgs, input_file: &str, output_file: &str) -> AvifRe
         settings.mutable.quality = args.quality.unwrap_or(DEFAULT_ENCODE_QUALITY);
         encoder.update_settings(&settings.mutable)?;
         encoder.add_image(&image)?;
+    } else if let Some(gainmap) = &gainmap {
+        encoder.add_image_gainmap(&image, gainmap)?;
     } else {
         encoder.add_image(&image)?;
     }
@@ -838,6 +926,7 @@ fn validate_args(args: &CommandLineArgs) -> AvifResult<()> {
                     || args.quality.is_some()
                     || args.depth.is_some()
                     || args.index.is_some()
+                    || args.extract_gainmap
                 {
                     return Err(AvifError::UnknownError(
                         "--info contains unsupported extra arguments".into(),
@@ -864,6 +953,11 @@ fn validate_args(args: &CommandLineArgs) -> AvifResult<()> {
                 if args.depth.is_some() && extension != "png" {
                     return Err(AvifError::UnknownError(
                         "depth is only supported for png output".into(),
+                    ));
+                }
+                if args.png_compress.is_some() && extension != "png" {
+                    return Err(AvifError::UnknownError(
+                        "png-compress-level is only supported for png output".into(),
                     ));
                 }
             }

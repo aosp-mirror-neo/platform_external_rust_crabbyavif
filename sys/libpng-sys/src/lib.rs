@@ -1,4 +1,4 @@
-// Copyright 2024 Google LLC
+// Copyright 2026 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,12 +13,12 @@
 // limitations under the License.
 
 #[allow(warnings)]
-#[cfg(feature = "libgav1")]
+#[cfg(feature = "png")]
 pub mod bindings {
     // Blaze does not support the `OUT_DIR` configuration used by Cargo. Instead, it specifies a
     // complete path to the generated bindings as an environment variable.
     #[cfg(google3)]
-    include!(env!("CRABBYAVIF_LIBGAV1_BINDINGS_RS"));
+    include!(env!("CRABBYAVIF_LIBPNG_BINDINGS_RS"));
     #[cfg(not(google3))]
-    include!(concat!(env!("OUT_DIR"), "/libgav1_bindgen.rs"));
+    include!(concat!(env!("OUT_DIR"), "/libpng_bindgen.rs"));
 }
